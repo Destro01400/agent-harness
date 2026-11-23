@@ -1,0 +1,15 @@
+{
+  "name": "{{PACKAGE_NAME}}",
+  "version": "0.1.0",
+  "description": "{{DESCRIPTION}}",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "eval": "node src/eval_runner.ts",
+    "eval:gold": "node src/eval_runner.ts --gold",
+    "test": "node --test tests/harness.test.ts"
+  }
+}

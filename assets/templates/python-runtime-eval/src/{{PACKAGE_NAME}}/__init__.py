@@ -1,0 +1,61 @@
+"""{{PROJECT_NAME}}: {{DESCRIPTION}}"""
+
+from {{PACKAGE_NAME}}.harness import (
+    AgentHarness,
+    BudgetConfig,
+    CheckpointStore,
+    LoopDetectionHook,
+    MiddlewareHook,
+    PreCompletionVerifyHook,
+    RunResult,
+    TraceWriter,
+    redact_secrets,
+)
+from {{PACKAGE_NAME}}.provider import (
+    HarnessProfile,
+    LLMProvider,
+    Message,
+    MockProvider,
+    ModelResponse,
+    ToolCall,
+    Usage,
+    canonical_json,
+)
+from {{PACKAGE_NAME}}.tools import (
+    ApprovalPolicy,
+    ToolRegistry,
+    ToolResult,
+    ToolSpec,
+    build_safe_env,
+    create_default_tools,
+    resolve_in_workspace,
+    truncate_and_spill,
+)
+
+__all__ = [
+    "AgentHarness",
+    "ApprovalPolicy",
+    "BudgetConfig",
+    "CheckpointStore",
+    "HarnessProfile",
+    "LLMProvider",
+    "LoopDetectionHook",
+    "Message",
+    "MiddlewareHook",
+    "MockProvider",
+    "ModelResponse",
+    "PreCompletionVerifyHook",
+    "RunResult",
+    "ToolCall",
+    "ToolRegistry",
+    "ToolResult",
+    "ToolSpec",
+    "TraceWriter",
+    "Usage",
+    "build_safe_env",
+    "canonical_json",
+    "create_default_tools",
+    "redact_secrets",
+    "resolve_in_workspace",
+    "truncate_and_spill",
+]

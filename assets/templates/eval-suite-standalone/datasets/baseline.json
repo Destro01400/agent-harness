@@ -1,0 +1,28 @@
+{
+  "pass_at_1": 1.0,
+  "pass_at_k": 1.0,
+  "pass_pow_k": 1.0,
+  "tasks": [
+    {
+      "id": "task_artifact_state",
+      "pass_at_1": 1.0,
+      "pass_pow_k": 1.0
+    },
+    {
+      "id": "task_extract_json",
+      "pass_at_1": 1.0,
+      "pass_pow_k": 1.0
+    },
+    {
+      "id": "task_latency_p95",
+      "pass_at_1": 1.0,
+      "pass_pow_k": 1.0
+    },
+    {
+      "id": "task_negative_trigger_refusal",
+      "pass_at_1": 1.0,
+      "pass_pow_k": 1.0
+    }
+  ],
+  "trials_per_task": 3
+}
