@@ -115,7 +115,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 
@@ -134,40 +134,57 @@ def prefix_fingerprint(system_prompt: str, tools: list[dict[str, Any]]) -> str:
 
 # --- 2. Provider-Safe Assistant Turn Serializer (Preserves Reasoning Blocks) ---
 
-def format_assistant_history_entry(
+def format_assistant_history_items(
     *,
     provider_family: Literal["deepseek", "anthropic", "openai"],
     content: str,
     tool_calls: list[dict[str, Any]],
     reasoning_content: str | None = None,
     opaque_blocks: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Preserves required thinking/reasoning payloads; never casts tool outputs as role=user."""
+) -> list[dict[str, Any]]:
+    """Returns provider-native history items to append; preserves reasoning and never uses role=user for tools."""
     if provider_family == "deepseek":
         entry: dict[str, Any] = {"role": "assistant", "content": content}
         # DeepSeek thinking + tools requires `reasoning_content` on EVERY prior assistant turn.
         entry["reasoning_content"] = reasoning_content or ""
         if tool_calls:
             entry["tool_calls"] = tool_calls
-        return entry
+        return [entry]
 
     if provider_family == "anthropic":
         blocks: list[dict[str, Any]] = []
         if opaque_blocks:
-            blocks.extend(opaque_blocks)  # Verbatim {type: "thinking", thinking: ..., signature: ...}
+            blocks.extend(opaque_blocks)  # Verbatim {"type": "thinking", "thinking": ..., "signature": ...}
         if content:
             blocks.append({"type": "text", "text": content})
         for tc in tool_calls:
             blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["arguments"]})
-        return {"role": "assistant", "content": blocks}
+        return [{"role": "assistant", "content": blocks}]
 
-    # OpenAI Responses API: preserve `type=reasoning` encrypted_content items alongside outputs.
-    return {
-        "role": "assistant",
-        "content": content,
-        "reasoning_items": opaque_blocks or [],
-        "tool_calls": tool_calls,
-    }
+    # OpenAI Responses API: append top-level `input[]` items (never nested inside a Chat-Completions dict).
+    items: list[dict[str, Any]] = []
+    for block in opaque_blocks or []:
+        # Verbatim {"type": "reasoning", "id": ..., "encrypted_content": ...}
+        items.append(block)
+    if content:
+        items.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content}],
+            }
+        )
+    for tc in tool_calls:
+        raw_args = tc["arguments"]
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": tc["id"],
+                "name": tc["name"],
+                "arguments": raw_args if isinstance(raw_args, str) else canonical_json(raw_args),
+            }
+        )
+    return items
 
 
 # --- 3. Tier-2 Tool-Result Pruner (CompactionEdit before Summarization) ---
@@ -179,13 +196,14 @@ def prune_stale_tool_results(
     keep_recent_thinking_turns: int = 1,
     exclude_tools: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Pure projection: clears deep tool result bodies & old thinking without mutating the log."""
+    """Pure projection: clears deep tool result bodies & pre-user-turn thinking without mutating the log."""
     excluded = exclude_tools or set()
     tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     protected_tools = set(tool_indices[-keep_recent_tool_results:]) if keep_recent_tool_results > 0 else set()
 
     asst_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
     protected_thinking = set(asst_indices[-keep_recent_thinking_turns:]) if keep_recent_thinking_turns > 0 else set()
+    last_user_idx = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
 
     projected: list[dict[str, Any]] = []
     for i, msg in enumerate(messages):
@@ -193,10 +211,11 @@ def prune_stale_tool_results(
         if copy.get("role") == "tool" and i not in protected_tools:
             if copy.get("tool_name") not in excluded and len(str(copy.get("content", ""))) > 240:
                 copy["content"] = "[PRUNED: Earlier tool output cleared to save context. Re-run tool or read spill file if needed.]"
-        elif copy.get("role") == "assistant" and i not in protected_thinking:
-            # Only drop thinking when NOT targeting DeepSeek thinking+tools (which mandates echoing it).
+        elif copy.get("role") == "assistant" and i < last_user_idx and i not in protected_thinking:
+            # DeepSeek V3.2 mandates echoing `reasoning_content` across every tool-calling step,
+            # but allows dropping prior-turn reasoning strictly after a NEW user message arrives.
             if copy.get("_allow_thinking_prune"):
-                copy.pop("reasoning_content", None)
+                copy = {k: v for k, v in copy.items() if k != "reasoning_content"}  # harness-audit: ignore AH011
         projected.append(copy)
     return projected
 
@@ -270,9 +289,9 @@ import { createHash } from "node:crypto";
 export function stableJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
-    a.localeCompare(b),
-  );
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
 }
 
@@ -280,7 +299,11 @@ export function prefixFingerprint(
   systemPrompt: string,
   tools: readonly Record<string, unknown>[],
 ): string {
-  const sortedTools = [...tools].sort((a, b) => String(a.name ?? "").localeCompare(String(b.name ?? "")));
+  const sortedTools = [...tools].sort((a, b) => {
+    const na = String(a.name ?? "");
+    const nb = String(b.name ?? "");
+    return na < nb ? -1 : na > nb ? 1 : 0;
+  });
   return createHash("sha256")
     .update(stableJson({ tools: sortedTools, system: systemPrompt }))
     .digest("hex")
@@ -305,7 +328,7 @@ export function pruneStaleToolResults(
   messages.forEach((m, i) => {
     if (m.role === "tool") toolIndices.push(i);
   });
-  const protectedIdx = new Set(toolIndices.slice(-keep));
+  const protectedIdx = new Set(keep > 0 ? toolIndices.slice(-keep) : []);
 
   return messages.map((msg, idx) => {
     if (

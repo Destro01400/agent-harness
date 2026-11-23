@@ -116,7 +116,7 @@ When offloading content, attach **only credential-free URI references** on the s
 - `gen_ai.system_instructions_ref`
 - `gen_ai.tool.definitions_ref`
 
-**Hard rule:** Never embed pre-signed query tokens (`?X-Amz-Signature=...`, `?token=...`, `?sig=...`) or Basic Auth credentials inside any `*_ref` or `source.uri` attribute.
+**Hard rule:** Never embed pre-signed query tokens (`?X-Amz-Signature=...`, `?token=...`, `?access_token=...`, `?sig=...`) or Basic Auth credentials inside any `*_ref` or `source.uri` attribute.
 
 ### Python 3.11+ — Privacy-Safe OTel-Aligned Content Policy & Span Emitter
 
@@ -133,7 +133,7 @@ from typing import Any, Literal
 
 CaptureMode = Literal["NO_CONTENT", "SPAN_ONLY", "EVENT_ONLY", "SPAN_AND_EVENT"]
 VALID_CAPTURE_MODES: frozenset[str] = frozenset({"NO_CONTENT", "SPAN_ONLY", "EVENT_ONLY", "SPAN_AND_EVENT"})
-_CRED_QUERY_RE = re.compile(r"[?&](?:X-Amz-Signature|token|sig|api_key)=", re.IGNORECASE)
+_CRED_QUERY_RE = re.compile(r"[?&](?:X-Amz-Signature|token|access_token|sig|api_key)=", re.IGNORECASE)
 
 
 def resolve_capture_mode() -> CaptureMode:
@@ -180,9 +180,10 @@ class JsonlTraceWriter:
         attrs["gen_ai.operation.name"] = operation
         attrs["gen_ai.agent.name"] = self.agent_name
 
-        # Strip raw content unless explicitly opted in.
-        if self.capture_mode == "NO_CONTENT":
+        # Strip raw content from span attributes unless SPAN_ONLY or SPAN_AND_EVENT is opted in.
+        if self.capture_mode in ("NO_CONTENT", "EVENT_ONLY"):
             for sensitive in (
+                "gen_ai.system_instructions",
                 "gen_ai.input.messages",
                 "gen_ai.output.messages",
                 "gen_ai.tool.call.arguments",
@@ -230,13 +231,41 @@ import { dirname } from "node:path";
 export type CaptureMode = "NO_CONTENT" | "SPAN_ONLY" | "EVENT_ONLY" | "SPAN_AND_EVENT";
 
 const VALID_MODES = new Set<CaptureMode>(["NO_CONTENT", "SPAN_ONLY", "EVENT_ONLY", "SPAN_AND_EVENT"]);
-const CRED_QUERY_RE = /[?&](?:X-Amz-Signature|token|sig|api_key)=/i;
+const CRED_QUERY_RE = /[?&](?:X-Amz-Signature|token|access_token|sig|api_key)=/i;
 
 export function resolveCaptureMode(): CaptureMode {
   const raw = (process.env["OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT"] ?? "NO_CONTENT")
     .trim()
     .toUpperCase() as CaptureMode;
   return VALID_MODES.has(raw) ? raw : "NO_CONTENT";
+}
+
+export function assertSafeRefUri(uri: string): string {
+  if (CRED_QUERY_RE.test(uri)) {
+    throw new Error("Refusing to record URI containing forbidden query-string credentials.");
+  }
+  try {
+    const parsed = new URL(uri);
+    if (parsed.username || parsed.password) {
+      throw new Error("Refusing to record URI containing embedded Basic Auth credentials.");
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Refusing to record URI")) throw err;
+  }
+  const authority = (uri.split("://")[1] ?? uri).split("/")[0] ?? "";
+  if (authority.includes("@")) {
+    throw new Error("Refusing to record URI containing embedded credentials.");
+  }
+  return uri;
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
 }
 
 export interface TraceRecord {
@@ -251,13 +280,15 @@ export interface TraceRecord {
 }
 
 export class JsonlTraceWriter {
+  private readonly filePath: string;
+  private readonly traceId: string;
+  private readonly agentName: string;
   private readonly captureMode: CaptureMode;
 
-  constructor(
-    private readonly filePath: string,
-    private readonly traceId: string,
-    private readonly agentName: string,
-  ) {
+  constructor(filePath: string, traceId: string, agentName: string) {
+    this.filePath = filePath;
+    this.traceId = traceId;
+    this.agentName = agentName;
     this.captureMode = resolveCaptureMode();
   }
 
@@ -273,7 +304,8 @@ export class JsonlTraceWriter {
       "gen_ai.agent.name": this.agentName,
     };
 
-    if (this.captureMode === "NO_CONTENT") {
+    if (this.captureMode === "NO_CONTENT" || this.captureMode === "EVENT_ONLY") {
+      delete attributes["gen_ai.system_instructions"];
       delete attributes["gen_ai.input.messages"];
       delete attributes["gen_ai.output.messages"];
       delete attributes["gen_ai.tool.call.arguments"];
@@ -288,8 +320,8 @@ export class JsonlTraceWriter {
       "gen_ai.skill.source.uri",
     ]) {
       const val = attributes[key];
-      if (typeof val === "string" && CRED_QUERY_RE.test(val)) {
-        throw new Error(`Attribute ${key} contains forbidden query-string credentials.`);
+      if (typeof val === "string") {
+        assertSafeRefUri(val);
       }
     }
 
@@ -317,7 +349,7 @@ export class JsonlTraceWriter {
     };
 
     await mkdir(dirname(this.filePath), { recursive: true });
-    await appendFile(this.filePath, `${JSON.stringify(record)}\n`, "utf8");
+    await appendFile(this.filePath, `${stableStringify(record)}\n`, "utf8");
     return record;
   }
 }
@@ -343,7 +375,7 @@ python -B scripts/validate_trace.py path/to/trace.jsonl --mode trace --strict --
 | **Orphan Tool Calls** | `ERROR` | Every `tool_call` ID has a matching `tool_result` ID in the trace. | Swallowed tool crash or missing startup repair. |
 | **Doom-Loop Repeats** | `WARN`/`ERROR` | `>= 3` consecutive identical `(tool_name, args)` invocations. | Missing repeat-tool guard (`repeat-tool-reminder`) or opaque tool error messages. |
 | **Tool Output Flood** | `WARN` | Any single `tool_result` exceeds `--max-tool-chars` (default `50000`). | Missing output truncation / disk spill (`AH012`). |
-| **Secret Leak Scan** | `ERROR` | Matches `sk-`, `sk-ant-`, `AIza`, `AKIA[0-9A-Z]{16}`, `ghp_`, PEM private keys, `Bearer ...`, `?X-Amz-Signature=`, `?token=`. | Missing redaction filter or credentials inside sandbox (`AH005`). |
+| **Secret Leak Scan** | `ERROR` | Matches `sk-`, `sk-ant-`, `AIza`, `AKIA[0-9A-Z]{16}`, `gh[pousr]_`, PEM private keys (PKCS#1/PKCS#8), `Bearer ...`, `?X-Amz-Signature=`, `?token=`, `?access_token=`. | Missing redaction filter or credentials inside sandbox (`AH005`). |
 | **Lethal Trifecta Exfil** | `ERROR` | Untrusted external fetch -> sensitive path (`~/.ssh`, `.env`, `mcp.json`) -> outbound send/post in same trace. | Active prompt-injection exfiltration chain. |
 | **Unverified Completion** | `WARN` | File/state mutation followed by final completion with zero subsequent verification tool calls. | Missing pre-completion verification gate. |
 

@@ -35,9 +35,9 @@ It ships **15 reference guides**, **3 zero-dependency starter templates** with a
 
 | Template | Stack |
 |---|---|
-| `python-runtime-eval` | Python 3.11+ zero-deps (`asyncio`, `unittest`): `Model-visible ⟺ logged` JSONL session/trace, checkpoints, spill, `ApprovalPolicy`, budgets, deletable hooks, multi-trial `pass@k`/`pass^k` eval runner |
-| `typescript-runtime-eval` | TypeScript ESM (Node 24+ native type stripping, `node --test`, zero deps): `AbortSignal` timeouts, checkpoints, spill, trace redaction, budgets, deletable hooks, multi-trial `pass@k`/`pass^k` eval runner |
-| `eval-suite-standalone` | Python 3.11+ zero-deps standalone eval harness: `AgentAdapter`, deterministic outcome graders, `{grader_nonce}`-hardened judge contract, `--gold` verification, unbiased `pass@k`/`pass^k`, Wilson 95% CI, CI regression gate |
+| `python-runtime-eval` | Python 3.11+ zero-deps (`asyncio`, `unittest`): `Model-visible ⟺ logged` JSONL session/trace (`derive_messages_from_trace`), checkpoints, spill, 5-decision `ApprovalPolicy`, budgets, deletable hooks, multi-trial `pass@k`/`pass^k` eval runner |
+| `typescript-runtime-eval` | TypeScript ESM (Node 24+ native type stripping, `node --test`, zero deps): `AbortSignal` timeouts, `deriveMessagesFromTrace`, atomic async checkpoints, spill, 5-decision `ApprovalPolicy`, trace redaction, budgets, deletable hooks, multi-trial `pass@k`/`pass^k` eval runner |
+| `eval-suite-standalone` | Python 3.11+ zero-deps standalone eval harness: `AgentAdapter`, deterministic outcome graders, `{grader_nonce}`-hardened judge contract, `--gold` verification, unbiased `pass@k`/`pass^k`, Wilson 95% CI + `clustered_stderr`, per-task `pass_pow_k` CI regression gate |
 
 ---
 
@@ -72,7 +72,7 @@ agent-harness/
 │   └── production-deployment.md                     # Lazy sandboxes, queues, tenant quotas, dsh profiles, v0->vN, kill switches
 └── scripts/
     ├── scaffold_harness.py                          # Template scaffolder (--list/--template/--name/--out/--description/--force)
-    ├── audit_harness.py                             # Static auditor (AH001-AH016; --strict/--json/--sarif/--ignore-dir)
+    ├── audit_harness.py                             # Static auditor (AH001-AH016; --strict/--json/--sarif/--output/--ignore-dir)
     ├── validate_trace.py                            # Trace/dataset/eval validator (--mode/--strict/--json/--max-tool-chars)
     ├── test_scaffold.py                             # Scaffolder unit tests (unittest)
     ├── test_audit_harness.py                        # Auditor unit tests (unittest)
@@ -116,11 +116,13 @@ python scripts/scaffold_harness.py --template eval-suite-standalone --name AcmeE
 ### Audit an agent harness (Text / JSON / SARIF 2.1.0)
 
 ```bash
-python scripts/audit_harness.py path/to/your-agent                 # human-readable findings (AH001-AH016)
-python scripts/audit_harness.py path/to/your-agent --strict        # exit 1 on ERROR/WARN
-python scripts/audit_harness.py path/to/your-agent --json          # machine-readable JSON
-python scripts/audit_harness.py path/to/your-agent --sarif         # SARIF 2.1.0 (excludes --json)
+python scripts/audit_harness.py path/to/your-agent                                      # human-readable findings (AH001-AH016)
+python scripts/audit_harness.py path/to/your-agent --strict                             # exit 1 on ERROR/WARN
+python scripts/audit_harness.py path/to/your-agent --json                               # machine-readable JSON
+python scripts/audit_harness.py path/to/your-agent --sarif --output harness-audit.sarif # UTF-8 SARIF 2.1.0 (no BOM; safe on Windows & CI)
 ```
+
+> **Inline suppressions:** Silence verified, intentional exceptions on a specific line with `# harness-audit: ignore AH001` (Python/YAML/Dockerfile) or `// harness-audit: ignore ALL` (JS/TS).
 
 ### Validate JSONL traces, eval datasets, and eval summaries
 
@@ -147,9 +149,16 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Audit Agent Harness (SARIF)
-        run: python .agent/skills/agent-harness/scripts/audit_harness.py . --sarif > harness-audit.sarif
-      - uses: github/codeql-action/upload-sarif@v3
+        id: audit
+        continue-on-error: true
+        run: python .agent/skills/agent-harness/scripts/audit_harness.py . --sarif --output harness-audit.sarif
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: harness-audit.sarif }
+      - name: Fail CI if security audit found errors
+        if: steps.audit.outcome == 'failure'
+        run: exit 1
 ```
 
 ### Run the unit tests
@@ -198,18 +207,30 @@ git clone https://github.com/Destro01400/agent-harness.git .opencode/skills/agen
 ### Como usar
 
 ```bash
-# Gerar um harness inicial a partir de um template
+# Listar templates e gerar um harness ou suíte de evals inicial
+python scripts/scaffold_harness.py --list
 python scripts/scaffold_harness.py --template python-runtime-eval --name MeuAgente --out ./MeuAgente
+python scripts/scaffold_harness.py --template typescript-runtime-eval --name MeuAgente --out ./MeuAgenteTS
+python scripts/scaffold_harness.py --template eval-suite-standalone --name MeusEvals --out ./MeusEvals
 
-# Auditar um projeto (use --strict no CI e --sarif para o GitHub Code Scanning)
+# Auditar um projeto (texto, --strict no CI, --json ou --sarif --output em UTF-8 sem BOM)
+python scripts/audit_harness.py caminho/do/seu-agente
 python scripts/audit_harness.py caminho/do/seu-agente --strict
-python scripts/audit_harness.py caminho/do/seu-agente --sarif > harness-audit.sarif
+python scripts/audit_harness.py caminho/do/seu-agente --json
+python scripts/audit_harness.py caminho/do/seu-agente --sarif --output harness-audit.sarif
 
 # Validar traces JSONL, datasets ou relatórios de eval
-python scripts/validate_trace.py caminho/dos/traces --strict
+python scripts/validate_trace.py caminho/dos/traces/ --strict
+python scripts/validate_trace.py caminho/do/session.jsonl --mode trace --json
+python scripts/validate_trace.py caminho/do/eval_summary.json --mode eval_summary --strict
+
+# Rodar a suíte de testes unitários dos scripts
+python -B -m unittest discover -s scripts -p "test_*.py" -v
 ```
 
-O exemplo de workflow do GitHub Actions acima (seção *GitHub Code Scanning*) funciona igualmente para projetos em português.
+> **Supressão inline de regras:** para exceções intencionais já verificadas em uma linha específica, use `# harness-audit: ignore AH001` (Python/YAML/Dockerfile) ou `// harness-audit: ignore ALL` (JS/TS).
+
+O exemplo de workflow do GitHub Actions acima (seção *GitHub Code Scanning* — usando `--output`, `continue-on-error: true`, `if: always()` no upload SARIF e passo final de falha) funciona igualmente para projetos em português.
 
 ---
 

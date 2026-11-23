@@ -94,19 +94,28 @@ Even in `workspace-write` mode, mount or ACL-protect high-leverage control paths
 
 ### Linux `bubblewrap` Invocation Example
 
+Standard HTTP clients (`curl`, `git`, `pip`, `npm`, Python `urllib`/`requests`/`httpx`, Node `fetch`) do **not** natively support `http+unix://` in `HTTP_PROXY`. Production `bwrap` sandboxes (such as Anthropic's `@anthropic-ai/sandbox-runtime`) mount the host proxy Unix domain socket into the `--unshare-all` namespace, bridge it to a sandbox-local loopback listener via `socat`, and point `HTTP_PROXY`/`HTTPS_PROXY` at `http://127.0.0.1:3128` (`bwrap` automatically brings up the isolated `lo` interface):
+
 ```bash
 bwrap \
   --unshare-all --die-with-parent --new-session \
   --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib \
+  --ro-bind-try /lib64 /lib64 \
   --proc /proc --dev /dev --tmpfs /tmp \
   --bind "$WORKSPACE" /workspace \
-  --ro-bind "$WORKSPACE/.git" /workspace/.git \
-  --ro-bind "$PROXY_SOCK" /run/egress-proxy.sock \
+  --ro-bind-try "$WORKSPACE/.git" /workspace/.git \
+  --bind "$PROXY_SOCK" /run/egress-proxy.sock \
   --chdir /workspace \
   --clearenv \
   --setenv PATH /usr/bin:/bin \
-  --setenv HTTP_PROXY "http+unix://%2Frun%2Fegress-proxy.sock" \
-  -- /usr/bin/pytest -q
+  --setenv HTTP_PROXY "http://127.0.0.1:3128" \
+  --setenv HTTPS_PROXY "http://127.0.0.1:3128" \
+  -- /bin/sh -c '
+    socat TCP-LISTEN:3128,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/egress-proxy.sock &
+    BRIDGE_PID=$!
+    trap "kill $BRIDGE_PID 2>/dev/null || true" EXIT
+    /usr/bin/pytest -q
+  '
 ```
 
 ---
@@ -224,7 +233,8 @@ DENIED_SEGMENTS = frozenset({
     ".git", ".ssh", ".aws", ".gnupg", ".cursor", ".vscode", ".agents", ".codex", ".claude",
 })
 DENIED_FILENAMES = frozenset({
-    ".env", ".env.local", ".env.production", "mcp.json", "compose.yaml", "compose.yml", "docker-compose.yml",
+    ".env", ".env.local", ".env.production", ".npmrc", ".pypirc",
+    "mcp.json", "compose.yaml", "compose.yml", "docker-compose.yml",
 })
 
 
@@ -253,31 +263,63 @@ def resolve_safe_path(workspace_root: Path, user_path: str, *, allow_write: bool
 ### TypeScript (strict ESM) — Safe Workspace Path Resolver
 
 ```typescript
-import { realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const DENIED_SEGMENTS = new Set([
   ".git", ".ssh", ".aws", ".gnupg", ".cursor", ".vscode", ".agents", ".codex", ".claude",
 ]);
 const DENIED_FILES = new Set([
-  ".env", ".env.local", ".env.production", "mcp.json", "compose.yaml", "compose.yml", "docker-compose.yml",
+  ".env", ".env.local", ".env.production", ".npmrc", ".pypirc",
+  "mcp.json", "compose.yaml", "compose.yml", "docker-compose.yml",
 ]);
 
-export async function resolveSafePath(workspaceRoot: string, rawPath: string): Promise<string> {
+export async function resolveSafePath(
+  workspaceRoot: string,
+  rawPath: string,
+  allowWrite = false,
+): Promise<string> {
   const canonicalRoot = await realpath(workspaceRoot);
   const candidate = resolve(canonicalRoot, rawPath);
 
-  // Resolve existing parent to catch symlink escapes even when target file does not yet exist.
-  let canonicalCandidate: string;
-  try {
-    canonicalCandidate = await realpath(candidate);
-  } catch {
-    canonicalCandidate = candidate;
+  // Walk upward until an existing ancestor resolves with realpath(), catching
+  // symlink/junction escapes even when multiple trailing directories do not exist yet.
+  let cursor = candidate;
+  const missingTail: string[] = [];
+  let resolvedAncestor: string;
+  while (true) {
+    try {
+      resolvedAncestor = await realpath(cursor);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      // Reject dangling symlinks (lstat succeeds even when symlink target does not exist).
+      try {
+        const entry = await lstat(cursor);
+        if (entry.isSymbolicLink()) {
+          throw new Error(`Refusing to follow dangling symlink in '${rawPath}'.`);
+        }
+      } catch (lstatErr) {
+        if ((lstatErr as NodeJS.ErrnoException).code !== "ENOENT") throw lstatErr;
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) {
+        throw new Error(`Path '${rawPath}' has no resolvable ancestor.`);
+      }
+      missingTail.unshift(basename(cursor));
+      cursor = parent;
+    }
   }
 
+  const canonicalCandidate =
+    missingTail.length > 0 ? join(resolvedAncestor, ...missingTail) : resolvedAncestor;
+
   const rel = relative(canonicalRoot, canonicalCandidate);
-  if (rel.startsWith("..") || isAbsolute(rel)) {
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new Error(`Path '${rawPath}' escapes workspace root.`);
+  }
+  if (allowWrite && rel === "") {
+    throw new Error("Refusing to overwrite workspace root directory.");
   }
 
   const parts = rel
@@ -318,9 +360,17 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("google_key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("github_pat", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
-    ("pem_private_key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----")),
+    (
+        "pem_private_key",
+        re.compile(
+            r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----)?"
+        ),
+    ),
     ("bearer_token", re.compile(r"(?i)Bearer\s+[A-Za-z0-9._-]{20,}")),
-    ("signed_url_param", re.compile(r"([?&](?:X-Amz-Signature|token|sig|api_key)=)[^&\s]+")),
+    (
+        "signed_url_param",
+        re.compile(r"([?&](?:X-Amz-Signature|token|access_token|sig|api_key)=)[^&\s\"']+", re.IGNORECASE),
+    ),
 )
 
 
@@ -372,11 +422,14 @@ const SECRET_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
   ["google_key", /AIza[0-9A-Za-z_-]{35}/g],
   ["aws_access_key", /AKIA[0-9A-Z]{16}/g],
   ["github_pat", /gh[pousr]_[A-Za-z0-9]{20,}/g],
-  ["pem_private_key", /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g],
+  [
+    "pem_private_key",
+    /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----)?/g,
+  ],
   ["bearer_token", /Bearer\s+[A-Za-z0-9._-]{20,}/gi],
 ];
 
-const SIGNED_URL_RE = /([?&](?:X-Amz-Signature|token|sig|api_key)=)[^&\s]+/g;
+const SIGNED_URL_RE = /([?&](?:X-Amz-Signature|token|access_token|sig|api_key)=)[^&\s"']+/gi;
 
 export function redactSecrets(input: string): string {
   let out = input.replace(SIGNED_URL_RE, "$1[REDACTED]");

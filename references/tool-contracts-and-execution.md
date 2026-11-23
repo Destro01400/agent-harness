@@ -1,6 +1,6 @@
 # Tool Contracts, Poka-Yoke ACI & Execution Pipelines
 
-Tools are contracts between deterministic infrastructure and non-deterministic agents—not 1:1 mirrors of REST endpoints or human GUIs. Designing an ergonomic **Agent-Computer Interface (ACI)** delivers some of the largest measured gains in agent engineering (+7 to +64.6 points on identical model weights).
+Tools are contracts between deterministic infrastructure and non-deterministic agents—not 1:1 mirrors of REST endpoints or human GUIs. Designing an ergonomic **Agent-Computer Interface (ACI)** delivers some of the largest measured gains in agent engineering (+7 to +61.6 points on identical model weights).
 
 ## Table of Contents
 
@@ -38,9 +38,9 @@ Mechanical edit failures waste huge portions of agent budgets (in SWE-agent, cas
 Two empirically validated anchored edit contracts dominate production coding harnesses:
 
 ### Option A: Hashline (`line:hash|` Content Anchors — Can Bölük / Stencil)
-Every line returned by `read_file` or `grep` carries a short 2–3 character deterministic content hash (e.g., `42:f1|  return total`). Edit operations reference `(start_anchor, end_anchor)` instead of reproducing old text or whitespace:
+Every line returned by `read_file` or `grep` carries a short **2–3 hex-character** deterministic content hash truncated from `blake2b`/`blake2s` or `sha256` (e.g., 2 hex chars / 256 buckets for compact files as in [coding-agent-patterns.md](coding-agent-patterns.md), or 3 hex chars / 4,096 buckets for larger files—always keep the same hash algorithm and slice width across read and edit tools, e.g., `42:f1|  return total`). Edit operations reference `(start_anchor, end_anchor)` instead of reproducing old text or whitespace:
 - **Optimistic concurrency for free:** If the file changed since reading, the hash check rejects the edit deterministically before corrupting the file.
-- **Measured impact across 16 LLMs:** **+15 pts average** over `apply_patch` (wins on **14/16** models; Grok Code Fast 1 **6.7% → 68.3% (+64.6 pts / 10×, −49% tokens)**; Grok 4 Fast **−61% output tokens**).
+- **Measured impact across 16 LLMs:** **+15 pts average** over `apply_patch` (wins on **14/16** models; Grok Code Fast 1 **6.7% → 68.3% (+61.6 pts / 10×, −49% tokens)**; Grok 4 Fast **−61% output tokens**).
 - **Per-model caveat:** DeepSeek V3.2 regressed **−5 pts** on Hashline vs. its post-trained edit format—select the edit variant via `HarnessProfile.edit_tool_variant`.
 
 ### Option B: 100-Line Stateful Viewer + Lint-Gated Range Edit (SWE-agent)
@@ -124,12 +124,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
 
-# --- 1. Hashline anchored read & edit ---
+# --- 1. Hashline anchored read & edit (2-3 hex chars from blake2/sha256) ---
 
 def line_hash(text: str) -> str:
     return hashlib.blake2b(text.encode("utf-8"), digest_size=2).hexdigest()[:3]
@@ -185,7 +186,8 @@ class SpillPolicy:
         line_count = output.count("\n") + 1
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
-            spill_path = self._dir / f"{call_id}.txt"
+            safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", call_id).strip(".") or "spill"
+            spill_path = self._dir / f"{safe_id}.txt"
             spill_path.write_text(output, encoding="utf-8")
             locator = (
                 f"Full output ({len(output)} chars, {line_count} lines) spilled to `{spill_path.as_posix()}`. "
@@ -218,6 +220,7 @@ class ToolDispatcher:
         self._spill = spill
         self._sem = asyncio.Semaphore(max_concurrency)
         self._idempotency_cache: dict[str, tuple[str, str]] = {}  # key -> (args_hash, result)
+        self._inflight: dict[str, tuple[str, asyncio.Task[tuple[bool, str]]]] = {}  # single-flight map
 
     def _validate(self, spec: ToolSpec, args: dict[str, Any]) -> str | None:
         unknown = set(args) - set(spec.param_types)
@@ -251,26 +254,48 @@ class ToolDispatcher:
                 continue
             runnable.append((call_id, spec, args))
 
-        # Phase 2: Barrier + bounded concurrent execute
+        # Phase 2: Barrier + bounded concurrent execute (single-flight idempotency)
+        async def _exec_handler(spec: ToolSpec, args: dict[str, Any]) -> tuple[bool, str]:
+            async with self._sem:
+                try:
+                    raw = await asyncio.wait_for(spec.handler(args), timeout=spec.timeout_s)
+                    return True, raw
+                except TimeoutError:
+                    return False, f"[TIMEOUT] `{spec.name}` exceeded {spec.timeout_s}s. Narrow scope or split call."
+                except Exception as exc:
+                    return False, f"[TOOL ERROR] `{spec.name}` failed: {exc}. Adjust arguments and retry."
+
         async def _run_one(cid: str, spec: ToolSpec, args: dict[str, Any]) -> tuple[str, str]:
             idem_key = args.get("idempotency_key")
+            if not isinstance(idem_key, str):
+                _, out = await _exec_handler(spec, args)
+                return cid, out
+
             args_hash = hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()
-            if isinstance(idem_key, str) and idem_key in self._idempotency_cache:
+            if idem_key in self._idempotency_cache:
                 prev_hash, prev_res = self._idempotency_cache[idem_key]
                 if prev_hash != args_hash:
                     return cid, f"[IDEMPOTENCY MISMATCH] Key `{idem_key}` reused with different parameters."
                 return cid, prev_res
 
-            async with self._sem:
-                try:
-                    raw = await asyncio.wait_for(spec.handler(args), timeout=spec.timeout_s)
-                except TimeoutError:
-                    return cid, f"[TIMEOUT] `{spec.name}` exceeded {spec.timeout_s}s. Narrow scope or split call."
-                except Exception as exc:
-                    return cid, f"[TOOL ERROR] `{spec.name}` failed: {exc}. Adjust arguments and retry."
-                if isinstance(idem_key, str):
-                    self._idempotency_cache[idem_key] = (args_hash, raw)
-                return cid, raw
+            # Single-flight guard: collapse concurrent callers sharing the same idempotency_key.
+            inflight = self._inflight.get(idem_key)
+            if inflight is not None:
+                inflight_hash, task = inflight
+                if inflight_hash != args_hash:
+                    return cid, f"[IDEMPOTENCY MISMATCH] Key `{idem_key}` reused with different parameters."
+                _, out = await asyncio.shield(task)
+                return cid, out
+
+            task = asyncio.create_task(_exec_handler(spec, args))
+            self._inflight[idem_key] = (args_hash, task)
+            try:
+                ok, out = await task
+                if ok:
+                    self._idempotency_cache[idem_key] = (args_hash, out)
+                return cid, out
+            finally:
+                self._inflight.pop(idem_key, None)
 
         parallel_tasks: list[asyncio.Task[tuple[str, str]]] = []
         for cid, spec, args in runnable:
@@ -299,6 +324,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+// Keep hash algorithm & width (2-3 hex chars from blake2/sha256) identical across read and edit.
 export function lineHash(line: string): string {
   return createHash("sha256").update(line, "utf8").digest("hex").slice(0, 3);
 }
@@ -314,11 +340,15 @@ export function formatHashlineSlice(content: string, startLine = 1, maxLines = 1
 }
 
 export class SpillPolicy {
-  constructor(
-    private readonly spillDir: string,
-    private readonly maxInlineChars = 24_000,
-    private readonly previewChars = 4_000,
-  ) {}
+  private readonly spillDir: string;
+  private readonly maxInlineChars: number;
+  private readonly previewChars: number;
+
+  constructor(spillDir: string, maxInlineChars = 24_000, previewChars = 4_000) {
+    this.spillDir = spillDir;
+    this.maxInlineChars = maxInlineChars;
+    this.previewChars = previewChars;
+  }
 
   async apply(callId: string, output: string): Promise<string> {
     if (output.length === 0) return "[OK: Command completed with no output.]";
@@ -330,9 +360,10 @@ export class SpillPolicy {
     let locator: string;
     try {
       await mkdir(this.spillDir, { recursive: true });
-      const filePath = join(this.spillDir, `${callId}.txt`).replaceAll("\\", "/");
+      const safeId = callId.replace(/[^A-Za-z0-9_.-]/g, "_").replace(/^\.+|\.+$/g, "") || "spill";
+      const filePath = join(this.spillDir, `${safeId}.txt`);
       await writeFile(filePath, output, "utf8");
-      locator = `Full output (${output.length} chars, ${lineCount} lines) spilled to \`${filePath}\`. Read line ranges or grep.`;
+      locator = `Full output (${output.length} chars, ${lineCount} lines) spilled to \`${filePath.replaceAll("\\", "/")}\`. Read line ranges or grep.`;
     } catch (err) {
       locator = `Output truncated (${output.length} chars); spill write failed (${String(err)}).`;
     }
@@ -351,12 +382,12 @@ export interface ToolSpec {
 
 export class ToolDispatcher {
   private readonly specs = new Map<string, ToolSpec>();
+  private readonly spill: SpillPolicy;
+  private readonly maxConcurrency: number;
 
-  constructor(
-    specs: readonly ToolSpec[],
-    private readonly spill: SpillPolicy,
-    private readonly maxConcurrency = 4,
-  ) {
+  constructor(specs: readonly ToolSpec[], spill: SpillPolicy, maxConcurrency = 4) {
+    this.spill = spill;
+    this.maxConcurrency = maxConcurrency;
     for (const s of specs) this.specs.set(s.name, s);
   }
 
@@ -436,7 +467,7 @@ export class ToolDispatcher {
 
 ## 8. Tool Contract Checklist
 
-- [ ] **Workflow consolidation:** Are overlapping CRUD endpoints consolidated into fewer high-signal workflow tools (≤15 upfront, or deferred via Tool Search / Code Mode)?
+- [ ] **Workflow consolidation:** Are overlapping CRUD endpoints consolidated into fewer high-signal workflow tools (enable lazy loading via Tool Search / Code Mode past `>10` MCP tools per Anthropic guidance; `audit_harness.py` `AH013` warns past `>15` static tools)?
 - [ ] **Namespacing & `input_examples`:** Are tools consistently namespaced and complex schemas paired with 1–5 canonical `input_examples`?
 - [ ] **Token-efficient returns:** Do read/search tools support `response_format: "concise" | "detailed"`, semantic IDs, and summarized search caps (≤50 hits)?
 - [ ] **Anchored edits:** Does file editing avoid fragile whitespace/line-count transcription (Hashline `line:hash|` or 100-line viewer + lint-gated revert selected via `HarnessProfile`)?

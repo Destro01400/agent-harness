@@ -3,29 +3,60 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
+import math
 import os
 import tempfile
 import time
-from dataclasses import dataclass, field
+import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Mapping, Sequence
 
 from {{PACKAGE_NAME}}.provider import ToolCall
 
 ApprovalDecision = Literal[
-    "allow_once",
-    "allow_session",
-    "ask",
-    "deny_once",
-    "deny_session",
+    "approve",
+    "modify",
+    "reject",
+    "escalate",
+    "terminate",
 ]
 
 VALID_APPROVAL_DECISIONS: frozenset[str] = frozenset(
-    {"allow_once", "allow_session", "ask", "deny_once", "deny_session"}
+    {"approve", "modify", "reject", "escalate", "terminate"}
 )
 
 DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "TMP", "TEMP")
+
+PROTECTED_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".vscode",
+        ".cursor",
+        ".agents",
+        "mcp.json",
+        ".npmrc",
+        ".pypirc",
+    }
+)
+
+ALLOWED_ENV_TEMPLATES: frozenset[str] = frozenset(
+    {
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+    }
+)
+
+
+class ToolExecutionError(RuntimeError):
+    """Recoverable tool failure carrying a structured machine-readable error code."""
+
+    def __init__(self, message: str, *, code: str = "execution_error") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def build_safe_env(
@@ -37,18 +68,78 @@ def build_safe_env(
     return {key: env_source[key] for key in allowlist if key in env_source}
 
 
+def _is_protected_segment(segment: str) -> bool:
+    norm = unicodedata.normalize("NFC", segment).casefold()
+    if norm in PROTECTED_PATH_SEGMENTS:
+        return True
+    if norm in ALLOWED_ENV_TEMPLATES:
+        return False
+    return norm == ".env" or norm.startswith(".env.")
+
+
 def resolve_in_workspace(workspace: Path, relative_path: str) -> Path:
-    """Canonicalize a path with realpath and reject escapes outside workspace."""
-    if not relative_path or not isinstance(relative_path, str):
-        raise ValueError("Path must be a non-empty string")
+    """Canonicalize a path with realpath, reject escapes, and block NFC protected paths."""
+    if not relative_path or not isinstance(relative_path, str) or "\x00" in relative_path:
+        raise ValueError("Path must be a non-empty string without NUL bytes")
     root = Path(os.path.realpath(workspace))
     candidate = Path(os.path.realpath(root / relative_path))
-    if os.path.commonpath([str(root), str(candidate)]) != str(root):
+    try:
+        common = os.path.commonpath([str(root), str(candidate)])
+    except ValueError as exc:
+        raise ValueError(
+            f"Path '{relative_path}' resolves outside workspace root. "
+            "Use a relative path inside the workspace."
+        ) from exc
+    if common != str(root):
         raise ValueError(
             f"Path '{relative_path}' resolves outside workspace root. "
             "Use a relative path inside the workspace."
         )
+
+    rel_parts = candidate.relative_to(root).parts
+    for seg in rel_parts:
+        if _is_protected_segment(seg):
+            raise ValueError(
+                f"Access to protected path '{relative_path}' ('{seg}') is denied by workspace policy."
+            )
     return candidate
+
+
+def _build_bounded_spill_output(text: str, max_chars: int, spill_path: Path) -> str:
+    file_name = spill_path.name
+
+    def _notice(omitted: int) -> str:
+        return f"\n...[truncated {omitted} chars; full: {file_name}]...\n"
+
+    kept = max(0, max_chars - len(_notice(len(text))))
+    for _ in range(4):
+        omitted = len(text) - kept
+        notice = _notice(omitted)
+        next_kept = max(0, max_chars - len(notice))
+        if next_kept == kept:
+            break
+        kept = next_kept
+
+    omitted = len(text) - kept
+    notice = _notice(omitted)
+    if len(notice) > max_chars:
+        return f"\n...[truncated {len(text)} chars]...\n"[:max_chars]
+
+    if kept + len(notice) > max_chars:
+        kept = max(0, max_chars - len(notice))
+        omitted = len(text) - kept
+        notice = _notice(omitted)
+        if kept + len(notice) > max_chars:
+            kept = max(0, kept - (kept + len(notice) - max_chars))
+            omitted = len(text) - kept
+            notice = _notice(omitted)
+
+    if kept == 0:
+        return notice[:max_chars]
+    head_len = kept // 2
+    tail_len = kept - head_len
+    tail = text[-tail_len:] if tail_len > 0 else ""
+    return f"{text[:head_len]}{notice}{tail}"
 
 
 def truncate_and_spill(
@@ -57,15 +148,15 @@ def truncate_and_spill(
     spill_dir: Path,
     label: str,
 ) -> tuple[str, bool, str | None]:
-    """Bound tool output in context while spilling full content atomically to disk."""
-    if max_chars < 120:
-        raise ValueError("max_chars must be at least 120")
+    """Bound tool output strictly <= max_chars while spilling full content atomically to disk."""
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 120:
+        raise ValueError("max_chars must be an integer >= 120")
     if len(text) <= max_chars:
         return text, False, None
 
     spill_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in label)
+    safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in label)[:32] or "tool"
     spill_path = spill_dir / f"{safe_label}_{digest}.txt"
 
     fd, tmp_name = tempfile.mkstemp(dir=str(spill_dir), prefix=".spill_", suffix=".tmp")
@@ -80,89 +171,172 @@ def truncate_and_spill(
             os.unlink(tmp_name)
         raise
 
-    omitted = len(text) - max_chars
-    notice = (
-        f"\n... [truncated {omitted} chars; full output saved to {spill_path.name} "
-        f"in spill directory] ...\n"
-    )
-    budget = max(40, max_chars - len(notice))
-    head_len = budget // 2
-    tail_len = budget - head_len
-    bounded = f"{text[:head_len]}{notice}{text[-tail_len:]}"
+    bounded = _build_bounded_spill_output(text, max_chars, spill_path)
     return bounded, True, str(spill_path)
 
 
+@dataclass(frozen=True)
+class ApprovalDirective:
+    """Rich approval response returned by custom deciders (supports modify without in-place mutation)."""
+
+    decision: ApprovalDecision
+    reason: str = ""
+    modified_arguments: dict[str, Any] | None = None
+    tool_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ApprovalEvaluation:
+    """Normalized outcome of ApprovalPolicy.evaluate()."""
+
+    approved: bool
+    decision: ApprovalDecision
+    reason: str
+    modified_arguments: dict[str, Any] | None = None
+    terminate_run: bool = False
+
+
+ApprovalDecider = Callable[[str, Mapping[str, Any]], ApprovalDecision | ApprovalDirective]
+
+
+def _normalize_directive(raw: ApprovalDecision | ApprovalDirective) -> ApprovalDirective:
+    if isinstance(raw, str):
+        return ApprovalDirective(decision=raw)
+    return raw
+
+
 class ApprovalPolicy:
-    """Five-decision HITL approval policy with 3-consecutive-rejection circuit breaker."""
+    """Inspect AI aligned 5-decision HITL policy (`approve`/`modify`/`reject`/`escalate`/`terminate`)."""
 
     def __init__(
         self,
-        default_decision: ApprovalDecision = "allow_once",
+        default_decision: ApprovalDecision | None = None,
         per_tool: Mapping[str, ApprovalDecision] | None = None,
-        decider: Callable[[str, Mapping[str, Any]], ApprovalDecision] | None = None,
+        decider: ApprovalDecider | None = None,
+        escalators: Sequence[ApprovalDecider] = (),
         max_consecutive_rejections: int = 3,
     ) -> None:
-        if default_decision not in VALID_APPROVAL_DECISIONS:
-            raise ValueError(f"Unsupported approval decision: {default_decision}")
-        if max_consecutive_rejections < 1:
+        resolved_default: ApprovalDecision = (
+            default_decision
+            if default_decision is not None
+            else ("escalate" if decider is not None else "approve")
+        )
+        if resolved_default not in VALID_APPROVAL_DECISIONS:
+            raise ValueError(f"Unsupported approval decision: {resolved_default}")
+        if isinstance(max_consecutive_rejections, bool) or max_consecutive_rejections < 1:
             raise ValueError("max_consecutive_rejections must be >= 1")
-        self.default_decision = default_decision
+        for tool, rule in (per_tool or {}).items():
+            if rule not in VALID_APPROVAL_DECISIONS:
+                raise ValueError(f"Unsupported approval decision '{rule}' for tool '{tool}'")
+
+        self.default_decision: ApprovalDecision = resolved_default
         self._per_tool: dict[str, ApprovalDecision] = dict(per_tool or {})
-        self._session_overrides: dict[str, ApprovalDecision] = {}
         self._decider = decider
+        self._escalators: tuple[ApprovalDecider, ...] = tuple(escalators)
         self.max_consecutive_rejections = max_consecutive_rejections
         self.consecutive_rejections = 0
         self.circuit_open = False
 
-    def evaluate(self, tool_name: str, arguments: Mapping[str, Any]) -> tuple[bool, ApprovalDecision, str]:
-        """Evaluate whether a tool call is approved, updating session state and circuit breaker."""
+    def evaluate(self, tool_name: str, arguments: Mapping[str, Any]) -> ApprovalEvaluation:
+        """Evaluate whether a tool call is approved without mutating proposed arguments in place."""
         if self.circuit_open:
-            return (
-                False,
-                "deny_session",
-                "Approval circuit breaker is open after repeated rejections. Stop and ask the user.",
+            return ApprovalEvaluation(
+                approved=False,
+                decision="terminate",
+                reason="Approval circuit breaker is open after repeated rejections. Run terminated.",
+                terminate_run=True,
             )
 
-        decision: ApprovalDecision = self._session_overrides.get(
-            tool_name,
-            self._per_tool.get(tool_name, self.default_decision),
+        base_decision: ApprovalDecision = self._per_tool.get(tool_name, self.default_decision)
+        directive = ApprovalDirective(decision=base_decision)
+
+        layers: list[ApprovalDecider] = []
+        if self._decider is not None:
+            layers.append(self._decider)
+        layers.extend(self._escalators)
+
+        if directive.decision == "escalate":
+            for layer in layers:
+                snapshot = copy.deepcopy(dict(arguments))
+                directive = _normalize_directive(layer(tool_name, snapshot))
+                if directive.decision != "escalate":
+                    break
+
+        decision: ApprovalDecision = (
+            directive.decision if directive.decision in VALID_APPROVAL_DECISIONS else "reject"
         )
-        if decision == "ask":
-            if self._decider is not None:
-                decision = self._decider(tool_name, arguments)
-            else:
-                decision = "deny_once"
 
-        if decision not in VALID_APPROVAL_DECISIONS:
-            decision = "deny_once"
+        if directive.tool_name is not None and directive.tool_name != tool_name:
+            return self._record_rejection(
+                tool_name,
+                "reject",
+                f"Approval policy cannot rename tool '{tool_name}' to '{directive.tool_name}'.",
+            )
 
-        if decision == "allow_session":
-            self._session_overrides[tool_name] = "allow_session"
+        if decision == "approve":
             self.consecutive_rejections = 0
-            return True, decision, "Allowed for session"
+            return ApprovalEvaluation(
+                approved=True,
+                decision="approve",
+                reason=directive.reason or "Approved by policy",
+                terminate_run=False,
+            )
 
-        if decision == "allow_once":
+        if decision == "modify":
+            if not isinstance(directive.modified_arguments, dict):
+                return self._record_rejection(
+                    tool_name,
+                    "reject",
+                    "Approval decision 'modify' requires a dict in modified_arguments.",
+                )
             self.consecutive_rejections = 0
-            return True, decision, "Allowed once"
+            return ApprovalEvaluation(
+                approved=True,
+                decision="modify",
+                reason=directive.reason or "Approved with modified arguments",
+                modified_arguments=copy.deepcopy(directive.modified_arguments),
+                terminate_run=False,
+            )
 
-        if decision == "deny_session":
-            self._session_overrides[tool_name] = "deny_session"
+        if decision == "terminate":
+            self.circuit_open = True
+            return ApprovalEvaluation(
+                approved=False,
+                decision="terminate",
+                reason=directive.reason or f"Tool '{tool_name}' triggered immediate termination.",
+                terminate_run=True,
+            )
 
+        default_reason = (
+            f"Tool '{tool_name}' was escalated with no approver accepting the call."
+            if decision == "escalate"
+            else f"Tool '{tool_name}' was rejected by approval policy."
+        )
+        return self._record_rejection(tool_name, decision, directive.reason or default_reason)
+
+    def _record_rejection(
+        self,
+        tool_name: str,
+        decision: ApprovalDecision,
+        reason: str,
+    ) -> ApprovalEvaluation:
         self.consecutive_rejections += 1
         if self.consecutive_rejections >= self.max_consecutive_rejections:
             self.circuit_open = True
-            return (
-                False,
-                decision,
-                f"Tool '{tool_name}' denied ({decision}); circuit breaker tripped after "
-                f"{self.consecutive_rejections} consecutive rejections.",
+            return ApprovalEvaluation(
+                approved=False,
+                decision="terminate",
+                reason=(
+                    f"Tool '{tool_name}' rejected ({decision}); circuit breaker upgraded to "
+                    f"terminate after {self.consecutive_rejections} consecutive rejections. {reason}"
+                ),
+                terminate_run=True,
             )
-
-        return (
-            False,
-            decision,
-            f"Tool '{tool_name}' was denied by approval policy ({decision}). "
-            "Choose a safer read-only alternative or ask the user for clarification.",
+        return ApprovalEvaluation(
+            approved=False,
+            decision=decision,
+            reason=f"{reason} Choose a safer read-only alternative or ask the user.",
+            terminate_run=False,
         )
 
 
@@ -205,6 +379,8 @@ class ToolResult:
     truncated: bool = False
     spill_path: str | None = None
     error_code: str | None = None
+    approval_decision: ApprovalDecision | None = None
+    executed_arguments: dict[str, Any] | None = None
 
 
 def _matches_json_type(value: Any, expected_type: str) -> bool:
@@ -213,7 +389,7 @@ def _matches_json_type(value: Any, expected_type: str) -> bool:
     if expected_type == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if expected_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
     if expected_type == "boolean":
         return isinstance(value, bool)
     if expected_type == "array":
@@ -264,7 +440,7 @@ def validate_tool_arguments(spec: ToolSpec, arguments: Any) -> str | None:
 
 
 class ToolRegistry:
-    """Deterministic registry enforcing schema validation, approvals, timeouts, and spilling."""
+    """Deterministic registry enforcing schema-first validation, approvals, timeouts, and spilling."""
 
     def __init__(self, tools: Sequence[ToolSpec] = ()) -> None:
         self._tools: dict[str, ToolSpec] = {}
@@ -310,17 +486,7 @@ class ToolRegistry:
                 error_code="unknown_tool",
             )
 
-        approved, decision, reason = approval_policy.evaluate(spec.name, tool_call.arguments)
-        if not approved:
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                name=spec.name,
-                output=f"ERROR [approval_denied:{decision}]: {reason}",
-                ok=False,
-                duration_ms=(time.monotonic() - started) * 1000.0,
-                error_code=f"approval_denied:{decision}",
-            )
-
+        # 1. Validate arguments against JSON schema BEFORE approval so malformed calls never prompt or trip breaker.
         validation_error = validate_tool_arguments(spec, tool_call.arguments)
         if validation_error is not None:
             return ToolResult(
@@ -332,9 +498,55 @@ class ToolRegistry:
                 error_code="invalid_arguments",
             )
 
+        # 2. Evaluate Inspect AI 5-decision ApprovalPolicy on a defensive copy.
+        approval = approval_policy.evaluate(spec.name, tool_call.arguments)
+        if not approval.approved:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                name=spec.name,
+                output=f"ERROR [approval_denied:{approval.decision}]: {approval.reason}",
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000.0,
+                error_code=f"approval_denied:{approval.decision}",
+                approval_decision=approval.decision,
+            )
+
+        if approval.decision == "modify":
+            revalidation_error = validate_tool_arguments(spec, approval.modified_arguments)
+            if revalidation_error is not None:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    name=spec.name,
+                    output=(
+                        "ERROR [invalid_modified_arguments]: Approval policy 'modify' produced "
+                        f"invalid arguments: {revalidation_error}"
+                    ),
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000.0,
+                    error_code="invalid_modified_arguments",
+                    approval_decision=approval.decision,
+                )
+            effective_args = copy.deepcopy(approval.modified_arguments or {})
+        else:
+            effective_args = copy.deepcopy(dict(tool_call.arguments))
+
         timeout_s = min(spec.timeout_s, default_timeout_s) if spec.timeout_s > 0 else default_timeout_s
         try:
-            raw_output = await asyncio.wait_for(spec.handler(dict(tool_call.arguments)), timeout=timeout_s)
+            raw_output = await asyncio.wait_for(
+                spec.handler(copy.deepcopy(effective_args)),
+                timeout=timeout_s,
+            )
+        except ToolExecutionError as exc:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                name=spec.name,
+                output=f"ERROR [{exc.code}]: {exc}",
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000.0,
+                error_code=exc.code,
+                approval_decision=approval.decision,
+                executed_arguments=effective_args,
+            )
         except asyncio.TimeoutError:
             return ToolResult(
                 tool_call_id=tool_call.id,
@@ -346,6 +558,8 @@ class ToolRegistry:
                 ok=False,
                 duration_ms=(time.monotonic() - started) * 1000.0,
                 error_code="timeout",
+                approval_decision=approval.decision,
+                executed_arguments=effective_args,
             )
         except Exception as exc:
             return ToolResult(
@@ -358,13 +572,16 @@ class ToolRegistry:
                 ok=False,
                 duration_ms=(time.monotonic() - started) * 1000.0,
                 error_code="execution_error",
+                approval_decision=approval.decision,
+                executed_arguments=effective_args,
             )
 
-        bounded, truncated, spill_path = truncate_and_spill(
+        bounded, truncated, spill_path = await asyncio.to_thread(
+            truncate_and_spill,
             str(raw_output),
-            max_chars=max_output_chars,
-            spill_dir=spill_dir,
-            label=f"{spec.name}_{tool_call.id}",
+            max_output_chars,
+            spill_dir,
+            f"{spec.name}_{tool_call.id}",
         )
         return ToolResult(
             tool_call_id=tool_call.id,
@@ -374,6 +591,8 @@ class ToolRegistry:
             duration_ms=(time.monotonic() - started) * 1000.0,
             truncated=truncated,
             spill_path=spill_path,
+            approval_decision=approval.decision,
+            executed_arguments=effective_args,
         )
 
 
@@ -382,14 +601,21 @@ def create_default_tools(workspace: Path) -> ToolRegistry:
     root = workspace.resolve()
 
     async def read_file(args: dict[str, Any]) -> str:
-        target = resolve_in_workspace(root, args["path"])
-        content = await asyncio.to_thread(target.read_text, encoding="utf-8")
-        return content
+        def _read() -> str:
+            target = resolve_in_workspace(root, args["path"])
+            return target.read_text(encoding="utf-8")
+
+        return await asyncio.to_thread(_read)
 
     async def write_file(args: dict[str, Any]) -> str:
-        target = resolve_in_workspace(root, args["path"])
-
         def _write() -> str:
+            root_real = Path(os.path.realpath(root))
+            target = resolve_in_workspace(root_real, args["path"])
+            if target == root_real:
+                raise ToolExecutionError(
+                    "Refusing to overwrite workspace root directory.",
+                    code="invalid_path",
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".write_", suffix=".tmp")
             try:
@@ -408,30 +634,38 @@ def create_default_tools(workspace: Path) -> ToolRegistry:
 
     async def list_files(args: dict[str, Any]) -> str:
         rel = args.get("directory", ".")
-        target = resolve_in_workspace(root, rel)
 
         def _list() -> str:
+            root_real = Path(os.path.realpath(root))
+            target = resolve_in_workspace(root_real, rel)
             if not target.exists():
                 raise FileNotFoundError(f"Directory not found: {rel}")
-            entries = sorted(
-                str(p.relative_to(root)).replace("\\", "/")
-                for p in target.rglob("*")
-                if p.is_file()
-            )
+            entries: list[str] = []
+            for p in target.rglob("*"):
+                if not p.is_file():
+                    continue
+                rel_parts = p.relative_to(root_real).parts
+                if any(_is_protected_segment(part) for part in rel_parts):
+                    continue
+                entries.append(str(p.relative_to(root_real)).replace("\\", "/"))
+            entries.sort()
             return "\n".join(entries) if entries else "(empty workspace)"
 
         return await asyncio.to_thread(_list)
 
     async def verify_file(args: dict[str, Any]) -> str:
-        target = resolve_in_workspace(root, args["path"])
         expected = args.get("contains", "")
 
         def _verify() -> str:
+            target = resolve_in_workspace(root, args["path"])
             if not target.exists():
                 raise FileNotFoundError(f"File not found: {args['path']}")
             text = target.read_text(encoding="utf-8")
             if expected and expected not in text:
-                return f"VERIFY_FAIL: '{args['path']}' does not contain '{expected}'."
+                raise ToolExecutionError(
+                    f"VERIFY_FAIL: '{args['path']}' does not contain '{expected}'.",
+                    code="verify_failed",
+                )
             return f"VERIFY_OK: '{args['path']}' exists ({len(text)} chars)."
 
         return await asyncio.to_thread(_verify)

@@ -9,6 +9,8 @@ from {{PACKAGE_NAME}}.harness import (
     PreCompletionVerifyHook,
     RunResult,
     TraceWriter,
+    derive_messages_from_events,
+    derive_messages_from_trace,
     redact_secrets,
 )
 from {{PACKAGE_NAME}}.provider import (
@@ -22,7 +24,10 @@ from {{PACKAGE_NAME}}.provider import (
     canonical_json,
 )
 from {{PACKAGE_NAME}}.tools import (
+    ApprovalDirective,
+    ApprovalEvaluation,
     ApprovalPolicy,
+    ToolExecutionError,
     ToolRegistry,
     ToolResult,
     ToolSpec,
@@ -34,6 +39,8 @@ from {{PACKAGE_NAME}}.tools import (
 
 __all__ = [
     "AgentHarness",
+    "ApprovalDirective",
+    "ApprovalEvaluation",
     "ApprovalPolicy",
     "BudgetConfig",
     "CheckpointStore",
@@ -47,6 +54,7 @@ __all__ = [
     "PreCompletionVerifyHook",
     "RunResult",
     "ToolCall",
+    "ToolExecutionError",
     "ToolRegistry",
     "ToolResult",
     "ToolSpec",
@@ -55,6 +63,8 @@ __all__ = [
     "build_safe_env",
     "canonical_json",
     "create_default_tools",
+    "derive_messages_from_events",
+    "derive_messages_from_trace",
     "redact_secrets",
     "resolve_in_workspace",
     "truncate_and_spill",

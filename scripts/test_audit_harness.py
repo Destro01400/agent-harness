@@ -461,6 +461,378 @@ def suppressed(cmd):
                 rc_missing = ah.main([str(root / "does-not-exist")])
             self.assertEqual(rc_missing, 2)
 
+    def test_six_verified_false_positives_stay_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "evals").mkdir()
+            (root / "evals" / "suite.py").write_text("pass_at_k = lambda n, c, k: 1.0\n", encoding="utf-8")
+
+            # FP 1 (AH014 to_thread lambda), FP 2 (AH012 read_local_schema helper), FP 3 (AH013 router.register)
+            (root / "clean_tools.py").write_text(
+                '''import asyncio
+from pathlib import Path
+import subprocess
+import time
+
+async def safe_offloaded_run(cmd: list[str]) -> str:
+    proc = await asyncio.to_thread(lambda: subprocess.run(cmd, shell=False, timeout=5, capture_output=True, text=True))
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: time.sleep(0.01))
+    return proc.stdout[:200]
+
+def read_local_schema(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+def wire_routes(router, app, blueprint, api) -> None:
+'''
+                + "".join(f"    router.register('/r{i}', lambda: {i})\n" for i in range(8))
+                + "".join(f"    app.register('/a{i}', lambda: {i})\n" for i in range(4))
+                + "".join(f"    blueprint.register('/b{i}', lambda: {i})\n" for i in range(4))
+                + "".join(f"    api.register('/api{i}', lambda: {i})\n" for i in range(4)),
+                encoding="utf-8",
+            )
+
+            # FP 4 (AH003 TS class method eval + obj.eval), FP 5 (AH007 fetch with timeout helper & multiline opts)
+            (root / "clean_ts.ts").write_text(
+                '''export class Calculator {
+  eval(expr: string): number {
+    return expr.length;
+  }
+  async evalAsync(expr: string): Promise<number> {
+    return this.eval(expr);
+  }
+}
+
+export class AsyncEval {
+  async eval(expr: string): Promise<string> {
+    return expr;
+  }
+}
+
+function makeInitWithTimeout(init: RequestInit): RequestInit {
+  return { ...init, signal: AbortSignal.timeout(5000) };
+}
+
+export async function postData(url: string, calc: Calculator): Promise<number> {
+  const res = await fetch(url, makeInitWithTimeout({ method: "POST" }));
+  const multilineOpts = {
+    method: "GET",
+    signal: AbortSignal.timeout(3000),
+  };
+  await fetch(url, multilineOpts);
+  return calc.eval(await res.text());
+}
+''',
+                encoding="utf-8",
+            )
+
+            # FP 6 (AH006 Dual-Boundary Compose with internal: true network + egress-proxy)
+            (root / "docker-compose.yml").write_text(
+                '''services:
+  sandbox:
+    image: python:3.12-slim@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    user: "10001:10001"
+    networks:
+      - sandbox_internal
+    volumes:
+      - ./workspace:/workspace:ro
+  egress-proxy:
+    image: envoyproxy/envoy:v1.31@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    user: "10001:10001"
+    networks:
+      - sandbox_internal
+      - external_egress
+
+networks:
+  sandbox_internal:
+    internal: true
+  external_egress: {}
+''',
+                encoding="utf-8",
+            )
+
+            res = ah.run_audit(root)
+            self.assertEqual(res["counts"], {"error": 0, "warn": 0, "info": 0}, msg=res["findings"])
+
+    def test_typed_python_annassign_aliases_and_false_negatives(self) -> None:
+        fake_gho = "gho_" + "A1b2C3d4E5f6G7h8I9j0K1"
+        fake_pem = "-----BEGIN " + "PRIVATE KEY-----"
+        fake_url = "https://api.example.com/v1?access_token=" + "secret987654"
+        py_code = f'''from datetime import datetime
+from os import system, popen
+import os
+import re
+import subprocess as sp
+from subprocess import run as r
+from time import sleep
+import httpx
+from pathlib import Path
+
+# TODO: migrate to docker
+BLOCKED_COMMANDS: list[str] = ["rm -rf", "sudo", "curl"]
+SYSTEM_PROMPT: str = f"Today is {{datetime.now()}}"
+TOOLS_LITERAL: list[dict[str, str]] = [{", ".join(f'{{"name": "t{i}"}}' for i in range(16))}]
+
+TOKEN_A = "{fake_gho}"
+PEM_HDR = "{fake_pem}"
+SIGNED = "{fake_url}"
+
+VERDICT_RE: re.Pattern[str] = re.compile(r"GRADE:\\s*(PASS|FAIL)")
+
+def run_unbounded(client, msgs):
+    while True:
+        step = client.complete(msgs)
+        if not step.tool_calls:
+            break
+    running = True
+    while running:
+        resp = client.complete(msgs)
+        running = bool(resp.tool_calls)
+    response = client.complete(msgs)
+    while response.tool_calls:
+        response = client.complete(msgs)
+
+def bad_shell_and_env(cmd: str):
+    r(cmd, shell=True, timeout=5)
+    sp.run(cmd, shell=True, timeout=5)
+    system(cmd)
+    popen(cmd)
+    env: dict[str, str] = os.environ.copy()
+    sp.run(["ls"], env=env, timeout=5)
+    sp.run(["ls"], env=os.environ | {{"X": "1"}}, timeout=5)
+
+def bad_retry(fn):
+    for attempt in range(3):
+        try:
+            return fn()
+        except Exception:
+            # TODO: add backoff
+            sleep(1)
+
+def bad_reasoning(messages, tool_result):
+    messages[0].pop("encrypted_content", None)
+    del messages[0]["encrypted_content"]
+    cleaned = {{k: v for k, v in messages[0].items() if k != "reasoning_content"}}
+    messages.append({{"content": tool_result, "role": "user"}})
+    return cleaned
+
+def tool_read(args: list[str]) -> str:
+    prefix = args[:2]
+    out: str = Path(prefix[0]).read_text(encoding="utf-8")
+    return out
+
+async def bad_async():
+    sleep(1)
+    httpx.get("https://example.com", timeout=5)
+
+def judge_submission(client, submission: str) -> str:
+    # boundary comment must not disable nonce check
+    prompt = f"Grade carefully: {{submission.strip()}}"
+    reply = client.complete(prompt, temperature=0.5)
+    m = VERDICT_RE.search(reply)
+    return m.group(1) if m else "FAIL"
+'''
+        details = self._audit_snippet("bad_typed_py.py", py_code)
+        by_rule: dict[str, list[dict]] = {}
+        for d in details:
+            by_rule.setdefault(d["rule_id"], []).append(d)
+
+        self.assertEqual(len(by_rule.get("AH001", [])), 3)
+        self.assertEqual(len(by_rule.get("AH002", [])), 4)
+        self.assertEqual(len(by_rule.get("AH004", [])), 1)
+        self.assertEqual(len(by_rule.get("AH005", [])), 5)  # 3 secrets + 2 env leaks
+        self.assertEqual(len(by_rule.get("AH009", [])), 1)
+        self.assertEqual(len(by_rule.get("AH010", [])), 1)
+        self.assertEqual(len(by_rule.get("AH011", [])), 4)
+        self.assertEqual(len(by_rule.get("AH012", [])), 1)
+        self.assertEqual(len(by_rule.get("AH013", [])), 1)
+        self.assertEqual(len(by_rule.get("AH014", [])), 2)
+        self.assertEqual(len(by_rule.get("AH015", [])), 3)
+
+        # AH016: retrieval.py must NOT fool _project_has_eval_suite(), and typed trials=1 default caught
+        ret_details = self._audit_snippet("retrieval.py", "def retrieve(q: str) -> str:\n    return q\n", include_eval=False)
+        self.assertTrue(any(d["rule_id"] == "AH016" and d["severity"] == "INFO" for d in ret_details))
+
+        eval_py = "TRIALS: int = 1\ndef run_eval(tasks, *, trials: int = 1):\n    return len(tasks) * trials\n"
+        eval_details = self._audit_snippet("eval_runner.py", eval_py, include_eval=False)
+        ah016_warns = [d for d in eval_details if d["rule_id"] == "AH016" and d["severity"] == "WARN"]
+        self.assertEqual(len(ah016_warns), 2)
+
+    def test_typescript_false_negatives_and_semicolon_safety(self) -> None:
+        ts_code = '''import * as childProc from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs/promises";
+
+const BLOCKED_COMMANDS: string[] = ["rm -rf", "sudo", "curl"];
+const systemPrompt: string = `Now: ${Date.now()}`;
+const STATIC_PROMPT = "Static prompt without semicolon"
+const unrelatedTime = Date.now()
+
+const sysMsg = {
+  role: "system",
+  content: `Current: ${Date.now()}`,
+};
+
+export async function badLoop(client: any) {
+  while (true) {
+    const step = await client.complete();
+    if (!step.toolCalls) break;
+  }
+  let running = true;
+  while (running) {
+    const r = await client.complete();
+    running = Boolean(r.toolCalls);
+  }
+}
+
+export function badShellAndDynamic(userArg: string) {
+  spawn(userArg, { shell: true, timeout: 5000 });
+  const cmd = `ls ${userArg}`;
+  childProc.execSync(cmd, { timeout: 5000 });
+  execFile("ls", ["-la"]);
+  const fn = Function("return " + userArg);
+  return fn();
+}
+
+export async function badRetry(fn: () => Promise<void>) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await fn();
+    } catch {
+      await sleep(1000);
+    }
+  }
+}
+
+export function badReasoning(msg: any, toolResult: string) {
+  const { thinking, ...rest } = msg;
+  delete msg["thinking"];
+  delete msg.reasoning_content;
+  const userMsg = { content: toolResult, role: "user" };
+  return [rest, userMsg];
+}
+
+export const toolReadAll = async (p: string) => fs.readFile(p, "utf8");
+
+export async function blockingAsync(p: string) {
+  const raw = readFileSync(p, "utf8");
+  writeFileSync(p + ".bak", raw);
+}
+
+export async function scoreSubmission(client: any, submission: string) {
+  const prompt = `Evaluate this answer and end with GRADE: PASS|FAIL\\n${submission}`;
+  const out = await client.complete(prompt, { temperature: 0.7 });
+  return out.match(/GRADE:\\s*(PASS|FAIL)/i);
+}
+'''
+        details = self._audit_snippet("scoring.ts", ts_code)
+        by_rule: dict[str, list[dict]] = {}
+        for d in details:
+            by_rule.setdefault(d["rule_id"], []).append(d)
+
+        self.assertEqual(len(by_rule.get("AH001", [])), 2)
+        self.assertEqual(len(by_rule.get("AH002", [])), 2)
+        self.assertEqual(len(by_rule.get("AH003", [])), 1)
+        self.assertEqual(len(by_rule.get("AH004", [])), 1)
+        self.assertEqual(len(by_rule.get("AH007", [])), 1)  # execFile without timeout
+        self.assertEqual(len(by_rule.get("AH009", [])), 1)
+        self.assertEqual(len(by_rule.get("AH010", [])), 2)  # systemPrompt + multiline sysMsg, NOT STATIC_PROMPT
+        self.assertEqual(len(by_rule.get("AH011", [])), 4)
+        self.assertEqual(len(by_rule.get("AH012", [])), 1)
+        self.assertEqual(len(by_rule.get("AH014", [])), 2)
+        self.assertEqual(len(by_rule.get("AH015", [])), 3)
+
+        eval_ts = "const trials: number = 1;\nexport function runEval(tasks: any[], trials: number = 1) { return tasks.length * trials; }\n"
+        eval_details = self._audit_snippet("eval_runner.ts", eval_ts, include_eval=False)
+        ah016_warns = [d for d in eval_details if d["rule_id"] == "AH016" and d["severity"] == "WARN"]
+        self.assertEqual(len(ah016_warns), 2)
+
+    def test_docker_compose_per_service_and_mcp_flag_value_parsing(self) -> None:
+        # Dockerfile: unpinned tag, implicit :latest, and USER root
+        bad_df = "FROM python:3.12\nFROM ubuntu\nUSER root\n"
+        df_details = self._audit_snippet("Dockerfile", bad_df)
+        self.assertEqual(sum(1 for d in df_details if d["rule_id"] == "AH006"), 3)
+
+        # Clean multi-stage Dockerfile with stage alias & non-root user
+        good_df = (
+            "FROM python:3.12-slim@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef AS builder\n"
+            "USER root\n"
+            "RUN echo build\n"
+            "FROM builder\n"
+            "USER 10001:10001\n"
+        )
+        good_df_details = self._audit_snippet("Dockerfile", good_df)
+        self.assertEqual([d for d in good_df_details if d["rule_id"] == "AH006"], [])
+
+        # Compose: dummy network_mode: none must NOT hide sandbox network_mode: host or unisolated service
+        bad_compose = '''services:
+  dummy:
+    image: busybox@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    network_mode: none
+  sandbox:
+    image: python:3.12-slim@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    network_mode: host
+  worker:
+    image: python:3.12-slim@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+'''
+        comp_details = self._audit_snippet("docker-compose.yml", bad_compose)
+        ah006 = [d for d in comp_details if d["rule_id"] == "AH006"]
+        self.assertEqual(len(ah006), 2)
+        self.assertTrue(any("network_mode: host" in d["message"] for d in ah006))
+        self.assertTrue(any("worker" in d["message"] for d in ah006))
+
+        # MCP: --cache /tmp/v1.0 flag-value pair, npx without -y, uvx unpinned vs pinned
+        mcp_json = json.dumps(
+            {
+                "mcpServers": {
+                    "npx_flag_val": {"command": "npx", "args": ["-y", "--cache", "/tmp/v1.0", "@scope/pkg"]},
+                    "npx_no_y": {"command": "npx", "args": ["@scope/unpinned"]},
+                    "uvx_unpinned": {"command": "uvx", "args": ["--python", "3.12", "mcp-server-git"]},
+                    "uvx_pinned": {"command": "uvx", "args": ["mcp-server-git==0.6.2"]},
+                }
+            }
+        )
+        mcp_details = self._audit_snippet("mcp.json", mcp_json)
+        ah013 = [d for d in mcp_details if d["rule_id"] == "AH013"]
+        self.assertEqual(len(ah013), 3)
+        self.assertTrue(any("@scope/pkg" in d["message"] and "/tmp/v1.0" not in d["message"] for d in ah013))
+        self.assertTrue(any("@scope/unpinned" in d["message"] for d in ah013))
+        self.assertTrue(any("mcp-server-git" in d["message"] for d in ah013))
+
+    def test_sarif_owasp_tags_uri_encoding_project_ah016_and_output_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # File with space in name, and no eval suite -> triggers AH007 + project-level AH016
+            (root / "my agent.py").write_text("import requests\nrequests.get('https://example.com')\n", encoding="utf-8")
+            sarif_out = root / "out" / "report.sarif"
+
+            rc = ah.main([str(root), "--sarif", "--output", str(sarif_out)])
+            self.assertEqual(rc, 0)  # WARN + INFO without --strict -> 0
+            raw_bytes = sarif_out.read_bytes()
+            self.assertFalse(raw_bytes.startswith(b"\xef\xbb\xbf"))  # UTF-8 without BOM
+
+            sarif = json.loads(raw_bytes.decode("utf-8"))
+            rules = {r["id"]: r for r in sarif["runs"][0]["tool"]["driver"]["rules"]}
+            self.assertIn("owasp-asi05", rules["AH002"]["properties"]["tags"])
+            self.assertNotIn("owasp-asi02", rules["AH002"]["properties"]["tags"])
+            self.assertIn("owasp-asi05", rules["AH003"]["properties"]["tags"])
+            self.assertNotIn("owasp-asi02", rules["AH003"]["properties"]["tags"])
+
+            results = sarif["runs"][0]["results"]
+            uris = [r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in results]
+            self.assertNotIn(".", uris)
+            self.assertEqual(uris, ["my%20agent.py", "my%20agent.py"])
+
+            # When no files exist for a project-level finding, locations should be omitted (never ".")
+            empty_sarif = ah.build_sarif_report(
+                {
+                    "primary_file": None,
+                    "details": [{"rule_id": "AH016", "severity": "INFO", "file": None, "line": None, "message": "No evals"}],
+                }
+            )
+            self.assertNotIn("locations", empty_sarif["runs"][0]["results"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

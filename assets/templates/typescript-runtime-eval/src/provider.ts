@@ -53,11 +53,16 @@ export interface ToolSchema {
   readonly input_examples?: readonly Record<string, unknown>[];
 }
 
+export interface CompleteOptions {
+  readonly signal?: AbortSignal;
+}
+
 export interface LLMProvider {
   complete(
     messages: readonly Message[],
     tools: readonly ToolSchema[],
     profile: HarnessProfile,
+    options?: CompleteOptions,
   ): Promise<ModelResponse>;
 }
 
@@ -138,7 +143,31 @@ export type MockHandler = (
   tools: readonly ToolSchema[],
   profile: HarnessProfile,
   callIndex: number,
+  options?: CompleteOptions,
 ) => ModelResponse | Promise<ModelResponse>;
+
+async function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) {
+    return await promise;
+  }
+  if (signal.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
+  }
+  let onAbort: (() => void) | undefined;
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Operation aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, abortPromise]);
+  } finally {
+    if (onAbort) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+}
 
 export class MockProvider implements LLMProvider {
   private readonly responses: readonly ModelResponse[];
@@ -160,7 +189,14 @@ export class MockProvider implements LLMProvider {
     messages: readonly Message[],
     tools: readonly ToolSchema[],
     profile: HarnessProfile,
+    options?: CompleteOptions,
   ): Promise<ModelResponse> {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason instanceof Error
+        ? options.signal.reason
+        : new Error("Provider request aborted");
+    }
+
     const idx = this.callIndex;
     this.callIndex += 1;
     this.recordedCalls.push({
@@ -171,7 +207,10 @@ export class MockProvider implements LLMProvider {
     });
 
     if (this.handler) {
-      return await this.handler(messages, tools, profile, idx);
+      return await raceWithAbort(
+        Promise.resolve(this.handler(messages, tools, profile, idx, options)),
+        options?.signal,
+      );
     }
 
     const scripted = this.responses[idx];

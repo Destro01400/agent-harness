@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -53,7 +55,7 @@ def load_tasks(path: Path) -> list[EvalTask]:
     """Load and validate a JSONL evaluation dataset (unique non-empty task IDs)."""
     tasks: list[EvalTask] = []
     seen_ids: set[str] = set()
-    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
         stripped = raw_line.strip()
         if not stripped:
             continue
@@ -84,6 +86,16 @@ def load_tasks(path: Path) -> list[EvalTask]:
     return tasks
 
 
+def _write_workspace_files(workspace: Path, files: dict[str, Any]) -> None:
+    ws_real = Path(os.path.realpath(workspace))
+    for rel_path, content in files.items():
+        dest = Path(os.path.realpath(ws_real / str(rel_path)))
+        if os.path.commonpath([str(ws_real), str(dest)]) != str(ws_real):
+            raise ValueError(f"Refusing to write outside workspace: {rel_path!r}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(str(content), encoding="utf-8")
+
+
 class GoldReferenceAdapter:
     """Deterministic gold reference adapter used by --gold to verify task/grader soundness."""
 
@@ -94,10 +106,9 @@ class GoldReferenceAdapter:
         trial_index: int,
     ) -> TrialResult:
         spec = task.gold_result
-        for rel_path, content in spec.get("write_files", {}).items():
-            dest = workspace / rel_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(str(content), encoding="utf-8")
+        write_files = spec.get("write_files", {})
+        if write_files:
+            await asyncio.to_thread(_write_workspace_files, workspace, dict(write_files))
         return TrialResult(
             task_id=task.id,
             trial_index=trial_index,
@@ -119,10 +130,9 @@ class DemoAdapter:
         trial_index: int,
     ) -> TrialResult:
         spec = task.demo_result or task.gold_result
-        for rel_path, content in spec.get("write_files", {}).items():
-            dest = workspace / rel_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(str(content), encoding="utf-8")
+        write_files = spec.get("write_files", {})
+        if write_files:
+            await asyncio.to_thread(_write_workspace_files, workspace, dict(write_files))
         return TrialResult(
             task_id=task.id,
             trial_index=trial_index,

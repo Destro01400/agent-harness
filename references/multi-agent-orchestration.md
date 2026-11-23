@@ -11,6 +11,7 @@ Multi-agent architectures are one of the highest-leverage patterns for parallel 
 5. [Scoped Subagent Budgets & Failure Containment](#5-scoped-subagent-budgets--failure-containment)
 6. [Multi-Agent Security (`ASI03`, `ASI07`, `ASI08`)](#6-multi-agent-security-asi03-asi07-asi08)
 7. [Implementation Patterns (Python & TypeScript)](#7-implementation-patterns-python--typescript)
+8. [Verification Checklist](#8-verification-checklist)
 
 ---
 
@@ -122,7 +123,6 @@ Multi-agent setups multiply blast radius if privileges cascade across agents (OW
 ```python
 import asyncio
 import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -199,7 +199,8 @@ async def run_parallel_subagents(
             digest = None
             path_str = None
             if brief.artifact_path.exists():
-                digest = hashlib.sha256(brief.artifact_path.read_bytes()).hexdigest()
+                raw_bytes = await asyncio.to_thread(brief.artifact_path.read_bytes)
+                digest = hashlib.sha256(raw_bytes).hexdigest()
                 path_str = str(brief.artifact_path)
             return SubagentResult(
                 task_id=brief.task_id,
@@ -227,6 +228,27 @@ export interface AgentEnvelope {
   readonly signatureHex: string;
 }
 
+function compareCodepoint(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function canonicalizeValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeValue(item));
+  }
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort(compareCodepoint)) {
+      const entry = (value as Record<string, unknown>)[key];
+      if (entry !== undefined) {
+        sorted[key] = canonicalizeValue(entry);
+      }
+    }
+    return sorted;
+  }
+  return value;
+}
+
 function canonicalPayload(env: Omit<AgentEnvelope, "signatureHex">): string {
   return JSON.stringify([
     env.schemaVersion,
@@ -234,7 +256,7 @@ function canonicalPayload(env: Omit<AgentEnvelope, "signatureHex">): string {
     env.sessionId,
     env.nonce,
     env.timestampMs,
-    Object.fromEntries(Object.entries(env.payload).sort(([a], [b]) => a.localeCompare(b))),
+    canonicalizeValue(env.payload),
   ]);
 }
 
@@ -255,6 +277,7 @@ export function verifyEnvelope(
 ): boolean {
   if (Math.abs(Date.now() - env.timestampMs) > maxSkewMs) return false;
   if (seenNonces.has(env.nonce)) return false;
+  if (!/^[0-9a-f]{64}$/i.test(env.signatureHex)) return false;
   const { signatureHex, ...unsigned } = env;
   const expected = createHmac("sha256", secret).update(canonicalPayload(unsigned)).digest();
   const actual = Buffer.from(signatureHex, "hex");
@@ -263,3 +286,14 @@ export function verifyEnvelope(
   return true;
 }
 ```
+
+---
+
+## 8. Verification Checklist
+
+- [ ] **Single-agent default verified:** Multi-agent orchestration is used only when read-only parallel exploration, frontier Generator/Evaluator separation, or disjoint `git worktree` ownership justifies the ~15× token overhead (never corporate org-chart roleplay).
+- [ ] **Delegation contract explicit:** Defaults to `as_tool` (`return_to_caller`); every subagent brief specifies objective, output format, tool/source bounds, and non-overlapping task boundaries.
+- [ ] **Filesystem artifact handoff:** Large outputs are written to dedicated disk/worktree paths and returned via `(artifact_uri, sha256, compact_summary, status)` rather than relayed through parent transcripts.
+- [ ] **Scoped budgets & containment:** Every subagent carries strictly narrower `turn`/`token`/`cost`/`time` ceilings than its parent, `max_depth` and `Semaphore(max_concurrency)` caps block fork bombs (`ASI08`), and subagent failures return structured error results without crashing the parent loop.
+- [ ] **Least-privilege security (`ASI03`/`ASI07`):** Subagents receive strictly narrowed tool allowlists (zero unscoped credential inheritance); networked envelopes use recursive codepoint-canonicalized HMAC/mTLS signatures with timestamp skew + nonce replay checks; untrusted subagent outputs are delimited as tainted data.
+- [ ] **Build-to-delete ablation:** Multi-agent scaffolding and evaluator loops are re-ablated on every frontier model upgrade so teams never pay 7×–10.5× overhead inside the model's solo capability frontier.

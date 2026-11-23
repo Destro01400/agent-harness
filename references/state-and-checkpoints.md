@@ -170,12 +170,13 @@ export interface SessionEvent<T = Record<string, unknown>> {
 
 export class DurableSessionLog {
   private nextSeq = 1;
+  private readonly sessionDir: string;
+  private readonly schemaVersion: number;
   private readonly filePath: string;
 
-  constructor(
-    private readonly sessionDir: string,
-    private readonly schemaVersion = 2,
-  ) {
+  constructor(sessionDir: string, schemaVersion = 2) {
+    this.sessionDir = sessionDir;
+    this.schemaVersion = schemaVersion;
     this.filePath = join(sessionDir, `session.v${schemaVersion}.jsonl`);
   }
 
@@ -266,6 +267,9 @@ Production harnesses enforce a strict two-channel boundary:
 ### Python 3.11+ — Settled Commit Separating `assistant/message` and `assistant/attempt`
 
 ```python
+from __future__ import annotations
+
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -296,10 +300,12 @@ async def stream_and_settle_turn(
                 usage = chunk["usage"]
     except BaseException as exc:
         # Record auditable failed/cancelled attempt without polluting model-visible history.
-        log.append(
+        is_cancelled = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, GeneratorExit))
+        await asyncio.to_thread(
+            log.append,
             "assistant/attempt",
             {
-                "status": "cancelled" if isinstance(exc, (KeyboardInterrupt, GeneratorExit)) else "failed",
+                "status": "cancelled" if is_cancelled else "failed",
                 "error_type": type(exc).__name__,
                 "error_message": str(exc),
                 "partial_text": "".join(text_parts),
@@ -308,7 +314,8 @@ async def stream_and_settle_turn(
         )
         raise
 
-    settled = log.append(
+    settled = await asyncio.to_thread(
+        log.append,
         "assistant/message",
         {
             "content": "".join(text_parts),
@@ -335,6 +342,11 @@ Two rules keep every resumed session valid:
 ### Python 3.11+ — Orphan Tool-Call Detection & Repair
 
 ```python
+from __future__ import annotations
+
+from typing import Any
+
+
 def repair_orphan_tool_calls(log: DurableSessionLog) -> list[str]:
     """Ensure every committed tool_call_id has a matching tool/result event."""
     events = log.read_events()
@@ -403,30 +415,33 @@ Implicit boolean flags (`done`, `waiting`, `errored`) cause illegal transitions 
 
 ```text
                 +------------------+
-                |     RUNNING      |<----------------------+
-                +---+----+----+----+                       |
-                    |    |    |                            | approve / modify / reject
-     escalate/ask   |    |    | budget exhausted           | (when rejections < 3)
-                    v    |    +------------------>+--------+--------+
-        +------------------+                      | BUDGET_EXCEEDED | (terminal)
-        | WAITING_APPROVAL |                      +-----------------+
-        +---+----+---------+
-            |    | terminate / 3 consecutive rejections
-            |    +------------------------------->+-----------------+
-            |                                     |     FAILED      | (terminal)
-            |              unrecoverable error    +-----------------+
-            |           RUNNING ----------------->^
-            |
-            |              natural stop + verified
-            +           RUNNING ----------------->+-----------------+
-                                                  |    COMPLETED    | (terminal)
+                |     RUNNING      |<-----------------------------------+
+                +---+----+----+----+                                    |
+                    |    |    |                                         |
+     escalate/ask   |    |    | budget exhausted                        | approve / modify /
+                    v    |    +------------------>+-----------------+   | reject (< 3)
+        +------------------+  wall-time expired   | BUDGET_EXCEEDED |   |
+        | WAITING_APPROVAL |--------------------->|   (terminal)    |   |
+        +--------+----+----+                      +-----------------+   |
+                 |    |                                                 |
+                 |    +-------------------------------------------------+
+                 | terminate / 3 consecutive rejections
+                 +------------------------------->+-----------------+
+                                                  |     FAILED      |
+                           unrecoverable error    |   (terminal)    |
+                        RUNNING ----------------->+-----------------+
+
+                           natural stop + verified
+                        RUNNING ----------------->+-----------------+
+                                                  |    COMPLETED    |
+                                                  |   (terminal)    |
                                                   +-----------------+
 ```
 
 | State | Terminal? | Permitted Outgoing Transitions | Persistence Action |
 |---|---|---|---|
 | `RUNNING` | No | `WAITING_APPROVAL`, `COMPLETED`, `FAILED`, `BUDGET_EXCEEDED` | Persist `step/start`, settled commits, and budget counters. |
-| `WAITING_APPROVAL` | No | `RUNNING` (on `approve`/`modify`/`reject` < 3), `FAILED` (on `terminate` or 3rd consecutive `reject`) | Persist pending `tool_call` + deterministic risk diff; pause `working_limit` clock (keep wall-clock `time_limit` active). |
+| `WAITING_APPROVAL` | No | `RUNNING` (on `approve`/`modify`/`reject` < 3), `FAILED` (on `terminate` or 3rd consecutive `reject`), `BUDGET_EXCEEDED` (if hard wall-clock `time_limit` expires while waiting) | Persist pending `tool_call` + deterministic risk diff; pause `working_limit` clock (keep wall-clock `time_limit` active). |
 | `COMPLETED` | Yes | None | Persist final verified summary & `turn/end`. |
 | `FAILED` | Yes | None | Persist structured `error_type`, `reason`, and any orphan repairs. |
 | `BUDGET_EXCEEDED` | Yes | None (requires explicit new run/budget override) | Persist breached dimension (`turn`, `token`, `cost`, `working_time`, `wall_time`). |
@@ -508,6 +523,11 @@ Every fresh worker session begins with the exact same 5-step orienting sequence 
 ### Python 3.11+ — Tamper-Resistant `feature_list.json` Guard
 
 ```python
+from __future__ import annotations
+
+from typing import Any
+
+
 def validate_feature_list_update(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> None:
     """Reject worker edits that delete features or alter acceptance steps."""
     if len(before) != len(after):
@@ -548,9 +568,13 @@ A prompt-injected or stuck model will repeatedly propose blocked actions (e.g., 
 ### Python 3.11+ — 5-Decision Approval Pipeline with 3-Rejection Breaker
 
 ```python
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 ApprovalDecisionKind = Literal["approve", "modify", "reject", "escalate", "terminate"]
 
@@ -613,7 +637,8 @@ class ApprovalPipeline:
                     ),
                 )
 
-        log.append(
+        await asyncio.to_thread(
+            log.append,
             "approval/decision",
             {
                 "tool_name": tool_name,
@@ -648,12 +673,19 @@ export interface Approver {
 
 export class ApprovalPipeline {
   private consecutiveRejections = 0;
+  private readonly approvers: readonly Approver[];
+  private readonly validateArgs: (toolName: string, args: Record<string, unknown>) => void;
+  private readonly maxConsecutiveRejections: number;
 
   constructor(
-    private readonly approvers: readonly Approver[],
-    private readonly validateArgs: (toolName: string, args: Record<string, unknown>) => void,
-    private readonly maxConsecutiveRejections = 3,
-  ) {}
+    approvers: readonly Approver[],
+    validateArgs: (toolName: string, args: Record<string, unknown>) => void,
+    maxConsecutiveRejections = 3,
+  ) {
+    this.approvers = approvers;
+    this.validateArgs = validateArgs;
+    this.maxConsecutiveRejections = maxConsecutiveRejections;
+  }
 
   async decide(
     toolName: string,

@@ -141,7 +141,12 @@ import json
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Any, Literal
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised when an orthogonal turn, message, token, cost, or time budget is exhausted."""
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,17 +223,17 @@ class BudgetTracker:
         self.messages = message_count
         wall_s = time.monotonic() - self._wall_start
         if self.turns >= self.cfg.turn_limit:
-            raise RuntimeError(f"BUDGET_EXCEEDED: turn_limit ({self.cfg.turn_limit})")
+            raise BudgetExceededError(f"BUDGET_EXCEEDED: turn_limit ({self.cfg.turn_limit})")
         if self.messages >= self.cfg.message_limit:
-            raise RuntimeError(f"BUDGET_EXCEEDED: message_limit ({self.cfg.message_limit})")
+            raise BudgetExceededError(f"BUDGET_EXCEEDED: message_limit ({self.cfg.message_limit})")
         if self.output_tokens >= self.cfg.output_token_limit:
-            raise RuntimeError(f"BUDGET_EXCEEDED: output_token_limit ({self.cfg.output_token_limit})")
+            raise BudgetExceededError(f"BUDGET_EXCEEDED: output_token_limit ({self.cfg.output_token_limit})")
         if self.cost_usd >= self.cfg.cost_limit_usd:
-            raise RuntimeError(f"BUDGET_EXCEEDED: cost_limit_usd (${self.cfg.cost_limit_usd:.2f})")
+            raise BudgetExceededError(f"BUDGET_EXCEEDED: cost_limit_usd (${self.cfg.cost_limit_usd:.2f})")
         if self.working_s >= self.cfg.working_limit_s:
-            raise RuntimeError(f"BUDGET_EXCEEDED: working_limit_s ({self.cfg.working_limit_s}s)")
+            raise BudgetExceededError(f"BUDGET_EXCEEDED: working_limit_s ({self.cfg.working_limit_s}s)")
         if wall_s >= self.cfg.time_limit_s:
-            raise RuntimeError(f"BUDGET_EXCEEDED: time_limit_s ({self.cfg.time_limit_s}s)")
+            raise BudgetExceededError(f"BUDGET_EXCEEDED: time_limit_s ({self.cfg.time_limit_s}s)")
 
         ratio = max(self.turns / self.cfg.turn_limit, wall_s / self.cfg.time_limit_s)
         if not self._warned and ratio >= self.cfg.soft_warn_ratio:
@@ -319,23 +324,27 @@ export interface HarnessProfile {
   readonly maxVerifyRetries: number;
 }
 
+export interface ModelRates {
+  readonly inputPerMtok: number;
+  readonly outputPerMtok: number;
+  readonly cacheReadPerMtok: number;
+  readonly cacheWritePerMtok: number;
+}
+
 export class BudgetTracker {
   private turns = 0;
   private outputTokens = 0;
   private costUsd = 0;
   private workingMs = 0;
   private warned = false;
-  private readonly wallStartMs = Date.now();
+  private readonly wallStartMs = performance.now();
+  private readonly cfg: BudgetConfig;
+  private readonly rates: ModelRates;
 
-  constructor(
-    private readonly cfg: BudgetConfig,
-    private readonly rates: {
-      inputPerMtok: number;
-      outputPerMtok: number;
-      cacheReadPerMtok: number;
-      cacheWritePerMtok: number;
-    },
-  ) {}
+  constructor(cfg: BudgetConfig, rates: ModelRates) {
+    this.cfg = cfg;
+    this.rates = rates;
+  }
 
   recordUsage(u: {
     inputTokens: number;
@@ -357,7 +366,7 @@ export class BudgetTracker {
   }
 
   checkPreStep(messageCount: number): string | undefined {
-    const wallMs = Date.now() - this.wallStartMs;
+    const wallMs = performance.now() - this.wallStartMs;
     if (this.turns >= this.cfg.turnLimit) throw new Error(`BUDGET_EXCEEDED: turnLimit (${this.cfg.turnLimit})`);
     if (messageCount >= this.cfg.messageLimit) throw new Error(`BUDGET_EXCEEDED: messageLimit (${this.cfg.messageLimit})`);
     if (this.outputTokens >= this.cfg.outputTokenLimit) throw new Error("BUDGET_EXCEEDED: outputTokenLimit");
@@ -379,11 +388,13 @@ export class BudgetTracker {
 export class DoomLoopGuard {
   private readonly callCounts = new Map<string, number>();
   private readonly fileEdits = new Map<string, number>();
+  private readonly repeatThreshold: number;
+  private readonly fileEditThreshold: number;
 
-  constructor(
-    private readonly repeatThreshold = 3,
-    private readonly fileEditThreshold = 5,
-  ) {}
+  constructor(repeatThreshold = 3, fileEditThreshold = 5) {
+    this.repeatThreshold = repeatThreshold;
+    this.fileEditThreshold = fileEditThreshold;
+  }
 
   inspect(toolName: string, args: Record<string, unknown>): string | undefined {
     const sorted = Object.keys(args)

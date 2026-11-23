@@ -51,7 +51,7 @@ Scaffold example: `python scripts/scaffold_harness.py --template python-runtime-
 | Connect+read timeouts, capped exponential backoff + full jitter, single-layer retry rule (anti-243× amplification), retry budgets, keeping recent errors in context, cancellation, sync-I/O offloading | [resilience-and-streaming.md](references/resilience-and-streaming.md) |
 | Task/Trial/Transcript/Outcome model, Capability vs. Regression suites, `--gold` solvability checks, per-trial isolation, unbiased `pass@k` & `pass^k`, Wilson 95% CI, clustered stderr, `sdk-minimal` | [eval-harness-design.md](references/eval-harness-design.md) |
 | Outcome-over-trajectory grading, deterministic code graders, `{grader_nonce}` LLM judge hardening, order-swapping, cross-family strict-majority panels, Krippendorff's α, τ-bench attribution, Swiss Cheese | [graders-and-regression.md](references/graders-and-regression.md) |
-| MCP token-bloat math, cache-preserving `defer_loading` + Tool Search Tool (>10 tools / >10K tokens), Programmatic Tool Calling / Code Mode (98.7% savings, PII tokenization), Tool Poisoning / Rug Pull / Shadowing defense | [mcp-and-dynamic-tools.md](references/mcp-and-dynamic-tools.md) |
+| MCP token-bloat math, cache-preserving `defer_loading` + Tool Search Tool (>10 MCP tools / >10K tokens; `AH013` warns at >15 static tools), Programmatic Tool Calling / Code Mode (98.7% savings, PII tokenization), Tool Poisoning / Rug Pull / Shadowing defense | [mcp-and-dynamic-tools.md](references/mcp-and-dynamic-tools.md) |
 | When NOT to use multi-agent (Cognition's 2 laws, UC Berkeley MAST 14 failure modes, 15× cost), valid topologies, `as_tool` vs. `handoff`, filesystem artifact handoff, scoped limits, `ASI03`/`ASI07`/`ASI08` | [multi-agent-orchestration.md](references/multi-agent-orchestration.md) |
 | Coding ACI (Hashline `line:hash\|`, 100-line viewer, lint-gated edit, ≤50-hit search, stateless bash), ~100-line `AGENTS.md` map, git worktrees, bootable CDP/LogQL/PromQL sensors, remediation linters, GC agents | [coding-agent-patterns.md](references/coding-agent-patterns.md) |
 | Decoupled Brain/Session/Hands scaling (lazy sandbox provisioning), queues & tenant quotas, declarative layered profiles (`dsh` bundle+patch), immutable `v0→vN` migrations, canary/digital-twin replay, kill switches | [production-deployment.md](references/production-deployment.md) |
@@ -61,7 +61,7 @@ Scaffold example: `python scripts/scaffold_harness.py --template python-runtime-
 | Tool | Usage |
 |---|---|
 | [scripts/scaffold_harness.py](scripts/scaffold_harness.py) | `--list`, `--template {python-runtime-eval,typescript-runtime-eval,eval-suite-standalone}`, `--name`, `--out`, `--description`, `--force`. Zero-dependency templates live in `assets/templates/`. |
-| [scripts/audit_harness.py](scripts/audit_harness.py) | `python scripts/audit_harness.py PROJECT_DIR [--strict] [--json \| --sarif] [--ignore-dir DIR]`. Scans Python, JS/TS, Docker, and MCP configs across 16 rules (`AH001`–`AH016`); emits Text, JSON, or SARIF 2.1.0. |
+| [scripts/audit_harness.py](scripts/audit_harness.py) | `python scripts/audit_harness.py PROJECT_DIR [--strict] [--json \| --sarif] [--output FILE] [--ignore-dir DIR]`. Scans Python, JS/TS, Docker, and MCP configs across 16 rules (`AH001`–`AH016`); emits Text, JSON, or SARIF 2.1.0 (UTF-8 via `--output`). Inline suppressions: `# harness-audit: ignore AHxxx` / `// harness-audit: ignore ALL`. |
 | [scripts/validate_trace.py](scripts/validate_trace.py) | `python scripts/validate_trace.py PATH [--mode {auto,trace,dataset,eval_summary}] [--strict] [--json] [--max-tool-chars 50000]`. Validates JSONL traces, token/cache invariants, secrets, Lethal Trifecta, and eval summaries. |
 | `scripts/test_scaffold.py`, `test_audit_harness.py`, `test_validate_trace.py` | Zero-dependency test suites: `python -B -m unittest discover -s scripts -p "test_*.py" -v`. |
 
@@ -80,8 +80,8 @@ Scaffold example: `python scripts/scaffold_harness.py --template python-runtime-
 
 ## Pre-Delivery Checklist
 
-1. **Static audit:** `python scripts/audit_harness.py PROJECT_DIR --strict` exits `0` (use `--sarif` in CI for GitHub Code Scanning).
+1. **Static audit:** `python scripts/audit_harness.py PROJECT_DIR --strict` exits `0` (use `--sarif --output harness-audit.sarif` in CI for GitHub Code Scanning).
 2. **Trace & eval validation:** `python scripts/validate_trace.py TRACE_OR_EVAL_DIR --strict` exits `0` (zero secret leaks, valid token/cache accounting, no orphan tool calls, `trials >= 3`).
 3. **Runtime invariants:** Hard step/token/cost/wall-clock/per-tool limits in code, single-layer jittered backoff, immutable cache prefix, reasoning preserved, failed turns kept with actionable errors.
 4. **Security boundary:** No `shell=True`/`eval()`/`exec()`, zero secrets in sandbox env, dual FS + network isolation, pinned MCP servers/schemas, consecutive-rejection circuit breaker active.
-5. **Eval rigor:** Outcome graders verified with `--gold` reference solutions, isolated per-trial environments, hardened judges (`{grader_nonce}`, `temperature=0`, last-match regex), and both `pass@k` and `pass^k` reported.
+5. **Eval rigor:** Outcome graders verified with `--gold` reference solutions, isolated per-trial environments, hardened judges (`{grader_nonce}`, `temperature=0`, last-match regex), and `pass@k`, `pass^k`, Wilson 95% CI, and `clustered_stderr` reported (with per-task `pass_pow_k` baseline gating).

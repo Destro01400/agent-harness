@@ -17,6 +17,7 @@ from {{PACKAGE_NAME}}.graders import (
     grade_trial,
     parse_last_grade,
 )
+
 __all__ = [
     "AgentAdapter",
     "DemoAdapter",

@@ -1,5 +1,5 @@
 {
-  "name": "{{PACKAGE_NAME}}",
+  "name": "{{PACKAGE_SLUG}}",
   "version": "0.1.0",
   "description": "{{DESCRIPTION}}",
   "private": true,

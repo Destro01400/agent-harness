@@ -1,6 +1,6 @@
 # Evaluation Harness Design & Statistical Rigor
 
-> **Core Principle:** Evaluating an agent at `trials=1` (`k=1`) hides catastrophic variance, while grading rigid tool sequences punishes better solutions. Build isolated multi-trial evals early with 20–50 real failure tasks, verify every task with a `--gold` reference solution, and report exact unbiased `pass@k`, `pass^k`, and Wilson 95% confidence intervals.
+> **Core Principle:** Evaluating an agent at `trials < 3` (especially `k=1`) hides catastrophic variance, while grading rigid tool sequences punishes better solutions. Build isolated multi-trial evals (`trials >= 3`) early with 20–50 real failure tasks, verify every task with a `--gold` reference solution, and report exact unbiased `pass@k`, `pass^k`, Wilson 95% confidence intervals, and clustered standard errors.
 
 ## Table of Contents
 
@@ -41,10 +41,10 @@ Never merge exploratory frontier benchmarks and CI release gates into a single u
 |---|---|---|
 | **Purpose** | Measure frontier headroom and guide harness/model hill-climbing. | Prevent silent regressions on every PR, prompt edit, tool change, or model upgrade. |
 | **Target Pass Rate** | Low to mid (e.g., 20%–70%) so there is clear signal to improve. | **~100%** (strict CI gate). |
-| **Primary Metric** | `pass@k` (can the agent solve it at all?) + `pass@1`. | `pass^k` (does it solve it *every time*?) + `pass@1` lower Wilson bound. |
-| **Failure Mode to Watch** | **Eval Saturation:** Once a suite climbs past 85%–95% (e.g., SWE-bench Verified jumping 30–40% -> >80%), it loses sensitivity to real improvements. | **Flaky tasks / broken fixtures** causing engineers to ignore red CI builds. |
+| **Primary Metric** | `pass@k` (can the agent solve it at all?) + `pass@1`. | `pass^k` (does it solve it *every time*?) + `pass@1` lower Wilson bound + per-task `pass_pow_k` baseline gate. |
+| **Failure Mode to Watch** | **Eval Saturation:** Once a suite climbs past 85%–95% (e.g., SWE-bench Verified jumping 30–40% -> >80%), it loses sensitivity to real improvements. | **Flaky tasks / broken fixtures** causing engineers to ignore red CI builds, or aggregate-only gating masking a per-task `pass_pow_k` collapse. |
 
-**Graduation Workflow:** When a capability task climbs reliably to near-100% across consecutive runs, **graduate** it into the CI regression suite and replace its capability slot with a harder real-world failure.
+**Graduation Workflow:** When a capability task climbs reliably to near-100% across consecutive runs, **graduate** it into the CI regression suite and replace its capability slot with a harder real-world failure. In CI baseline comparisons (as in `eval-suite-standalone`'s `compare_baseline`), gate on **both** aggregate metrics and per-task `pass_at_1` + `pass_pow_k` drops so a consistency collapse on one task cannot hide behind a stable suite average.
 
 ---
 
@@ -124,7 +124,7 @@ $$\text{center} = \frac{\hat{p} + \frac{z^2}{2N}}{1 + \frac{z^2}{N}}, \qquad \te
 
 ### 7.4 Clustered Standard Errors (`stderr(cluster=...)`)
 
-When multiple eval tasks share the same repository, database fixture, or domain cluster $g \in \{1, \dots, G\}$, trial errors are correlated within clusters—naive i.i.d. standard errors understate uncertainty and trigger false CI celebrations. Compute cluster-robust standard error over cluster totals $T_g = \sum_{i \in g} (x_i - \bar{x})$ with finite-sample correction $\frac{G}{G - 1}$:
+When multiple eval tasks share the same repository, database fixture, or domain cluster $g \in \{1, \dots, G\}$—**or when pooling repeated trials ($n \ge 3$) of the same task**—trial outcomes are correlated within clusters rather than i.i.d. draws. Pooled trial-level `wilson_ci_95` alone understates uncertainty and triggers false CI celebrations; always emit `clustered_stderr` (clustered by task or fixture/repo cluster) alongside `wilson_ci_95` (as implemented in `eval-suite-standalone`). Compute cluster-robust standard error over cluster totals $T_g = \sum_{i \in g} (x_i - \bar{x})$ with finite-sample correction $\frac{G}{G - 1}$:
 
 $$\text{SE}_{\text{cluster}} = \sqrt{\frac{G}{G - 1} \cdot \frac{1}{N^2} \sum_{g=1}^{G} T_g^2}$$
 
@@ -191,7 +191,8 @@ def clustered_stderr(scores: Sequence[float], clusters: Sequence[str]) -> float:
 
 ```typescript
 export function passAtK(n: number, c: number, k: number): number {
-  if (k <= 0 || n < k) return Number.NaN;
+  if (!Number.isInteger(n) || !Number.isInteger(c) || !Number.isInteger(k)) return Number.NaN;
+  if (k <= 0 || n < k || c < 0 || c > n) return Number.NaN;
   if (n - c < k) return 1.0;
   let prod = 1.0;
   for (let i = n - c + 1; i <= n; i += 1) {
@@ -201,7 +202,8 @@ export function passAtK(n: number, c: number, k: number): number {
 }
 
 export function passPowK(n: number, c: number, k: number): number {
-  if (k <= 0 || n < k) return Number.NaN;
+  if (!Number.isInteger(n) || !Number.isInteger(c) || !Number.isInteger(k)) return Number.NaN;
+  if (k <= 0 || n < k || c < 0 || c > n) return Number.NaN;
   if (c < k) return 0.0;
   // Numerically stable product form of C(c, k) / C(n, k).
   let prod = 1.0;
@@ -216,7 +218,9 @@ export function wilsonCi95(
   total: number,
   z = 1.959963984540054,
 ): readonly [number, number] {
-  if (total <= 0) return [Number.NaN, Number.NaN];
+  if (!Number.isFinite(successes) || !Number.isFinite(total) || total <= 0 || successes < 0 || successes > total) {
+    return [Number.NaN, Number.NaN];
+  }
   const p = successes / total;
   const z2 = z * z;
   const denom = 1 + z2 / total;
@@ -271,10 +275,10 @@ Integrate static auditing (`audit_harness.py`) and eval artifact validation (`va
 # 1. Catch missing eval suites or hardcoded trials=1 (AH016)
 python -B scripts/audit_harness.py ./my-agent --strict
 
-# 2. Validate JSONL eval dataset (unique non-empty id, input/prompt, expected/graders)
+# 2. Validate JSONL or JSON-array eval dataset (unique non-empty id, input/prompt, expected/graders)
 python -B scripts/validate_trace.py ./evals/tasks.jsonl --mode dataset --strict
 
-# 3. Validate eval summary JSON (trials_per_task > 1, pass^k <= pass@1 <= pass@k, gold_verified on 0%-pass tasks)
+# 3. Validate eval summary JSON (trials_per_task >= 3, finite pass^k <= pass@1 <= pass@k, gold_verified on 0%-pass tasks)
 python -B scripts/validate_trace.py ./evals/eval_summary.json --mode eval_summary --strict
 ```
 
@@ -297,21 +301,26 @@ python -B scripts/validate_trace.py ./evals/eval_summary.json --mode eval_summar
       "cluster": "runtime-core",
       "trials": 5,
       "passed": 5,
+      "pass_at_1": 1.0,
+      "pass_at_k": 1.0,
+      "pass_pow_k": 1.0,
       "gold_verified": true
     }
   ]
 }
 ```
 
+When comparing a candidate run against a saved `baseline.json` (as in `assets/templates/eval-suite-standalone`), enforce regression thresholds on **both** suite aggregates (`pass_at_1`, `pass_pow_k`) and **per-task `pass_at_1` and `pass_pow_k`** so consistency drops on individual tasks fail CI loudly.
+
 ---
 
 ## 10. Verification Checklist
 
 - [ ] **Object model separation:** Inference transcripts are persisted independently from grading so scores can be recomputed offline.
-- [ ] **Split suites:** Capability evals (headroom, monitored for saturation) and CI regression evals (~100% gate) are tracked separately with an explicit graduation workflow.
+- [ ] **Split suites:** Capability evals (headroom, monitored for saturation) and CI regression evals (~100% gate) are tracked separately with an explicit graduation workflow and per-task `pass_at_1` + `pass_pow_k` baseline gating.
 - [ ] **Real-failure seed:** Suite starts with 20–50 unambiguous real-world tasks verified by two experts.
 - [ ] **`--gold` verified:** Every task has a passing reference solution run in CI; any `0% pass@100` task triggers immediate spec/grader audit.
 - [ ] **Balanced triggers:** Positive and negative trigger cases are balanced to catch over-triggering.
 - [ ] **Strict per-trial isolation:** Fresh container/VM/workspace per trial, stripped future `.git` history, full cache keys `(run_id, instance_id, trial, sha, model)`, and bounded concurrency.
-- [ ] **Statistical rigor (`AH016`):** Multi-trial (`n >= 3`) runs report exact unbiased `pass@k`, `pass^k`, Wilson 95% CI, and clustered stderr (when tasks share fixtures), passing `validate_trace.py --mode eval_summary --strict`.
+- [ ] **Statistical rigor (`AH016`):** Multi-trial (`trials >= 3`) runs report finite, exact unbiased `pass@k`, `pass^k`, `wilson_ci_95`, and `clustered_stderr` alongside per-task metrics, passing `validate_trace.py --mode eval_summary --strict`.
 - [ ] **Benchmark profile isolation:** Core harness benchmarks execute under a stripped `sdk-minimal` profile with full resolved config dumped.

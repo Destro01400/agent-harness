@@ -24,9 +24,10 @@ Measured cost in production (Anthropic *Advanced Tool Use* & *Code Execution wit
 - **Accuracy degrades long before the context window fills:** Drew Breunig's *Context Confusion* analysis and Berkeley Function-Calling Leaderboard (BFCL v3) confirm every model degrades as tool count grows—on GeoEngine, quantized Llama 3.1 8B failed inside a 16K window with **46 tools** but succeeded when trimmed to **19 tools**.
 - **Intermediate payload blowup:** Even if tool schemas fit, chaining 10 MCP calls (e.g., pulling a 2-hour transcript from Google Drive and writing it to Salesforce) drags megabytes of raw intermediate JSON through the LLM context window twice.
 
-### Hard Threshold Rule
-- **$\le 10$ tools and $< 10\text{K}$ schema tokens:** Load statically in a deterministically sorted `tools` array (best KV-cache hit rate, zero extra indirection).
-- **$> 10$ tools or $> 10\text{K}$ schema tokens:** Switch to **Lazy Loading (`defer_loading: true` + Tool Search Tool)** or **Programmatic Tool Calling (Code Mode)**.
+### Recommended Threshold vs. Static Audit Ceiling
+- **$\le 10$ MCP tools and $< 10\text{K}$ schema tokens:** Load statically in a deterministically sorted `tools` array (best KV-cache hit rate, zero extra indirection).
+- **$> 10$ MCP tools or $> 10\text{K}$ schema tokens:** Switch to **Lazy Loading (`defer_loading: true` + Tool Search Tool)** or **Programmatic Tool Calling (Code Mode)** (Anthropic recommendation).
+- **Static auditor ceiling (`AH013`):** `scripts/audit_harness.py` defaults to warning past **$> 15$ static tools** registered in a single file across general codebases (balancing MCP strictness with low false-positive noise on small non-MCP apps).
 
 ---
 
@@ -73,8 +74,8 @@ When tasks require **$\ge 3$ dependent tool calls**, loops, pagination, cross-so
 
 | Catalog Size & Workload | Recommended Pattern | Why |
 |---|---|---|
-| $\le 10$ tools, `<10K` schema tokens, low payload size | **Static sorted tools** | Maximum KV-cache hit rate, zero discovery turn overhead |
-| $> 10$ tools or $>10\text{K}$ schema tokens, mostly single-step calls | **`defer_loading: true` + Tool Search Tool** | Cuts upfront tokens 85%, lifts selection accuracy +8.6 to +25 pp, preserves prefix cache |
+| $\le 10$ MCP tools, `<10K` schema tokens, low payload size | **Static sorted tools** | Maximum KV-cache hit rate, zero discovery turn overhead |
+| $> 10$ MCP tools or $>10\text{K}$ schema tokens, mostly single-step calls | **`defer_loading: true` + Tool Search Tool** | Cuts upfront tokens 85%, lifts selection accuracy +8.6 to +25 pp, preserves prefix cache |
 | Multi-step workflows ($\ge 3$ dependent calls), fan-out joins, large tabular/log filtering, PII pipelines | **Programmatic Tool Calling (Code Mode / `ptc-runtime`)** | Up to 98.7% token savings, keeps raw payloads & PII out of LLM context |
 | Massive multi-server enterprise catalog + data-heavy workflows | **Hybrid: Tool Search / FS Discovery + Code Mode** | Agent discovers only needed server modules (`./servers/jira/*.ts`), then executes batch logic in sandbox |
 
@@ -116,7 +117,9 @@ class MCPToolDef:
     input_schema: dict[str, Any]
     defer_loading: bool = True
     read_only: bool = False
+    destructive: bool = True
     idempotent: bool = False
+    open_world: bool = True
 
     @property
     def qualified_name(self) -> str:
@@ -129,6 +132,12 @@ class MCPToolDef:
                 "name": self.name,
                 "description": self.description,
                 "input_schema": self.input_schema,
+                "annotations": {
+                    "read_only": self.read_only,
+                    "destructive": self.destructive,
+                    "idempotent": self.idempotent,
+                    "open_world": self.open_world,
+                },
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -253,7 +262,7 @@ export class PIITokenizingToolBridge {
 
 ## 7. Production MCP Checklist
 
-- [ ] **Catalog budget enforced:** Static tools stay $\le 10$ tools / $< 10\text{K}$ tokens; larger catalogs use `defer_loading: true` + `tool_search` or Code Mode (`ptc-runtime`).
+- [ ] **Catalog budget enforced:** Static MCP catalogs stay $\le 10$ tools / $< 10\text{K}$ tokens (larger catalogs use `defer_loading: true` + `tool_search` or Code Mode `ptc-runtime`); general codebases stay within `audit_harness.py` (`AH013` warns past `> 15` static tools per file).
 - [ ] **Prefix cache preserved:** Core tools are sorted deterministically (`sort_keys=True`), deferred tools never mutate the initial prefix, and mid-turn `tools/list_changed` notifications are deferred to session boundaries.
 - [ ] **PTC safety enforced:** Only explicitly opted-in parallelizable/idempotent tools are callable inside `run_code`, behind a call-capped host proxy with zero credentials inside the execution VM.
 - [ ] **Supply chain pinned:** Every MCP server version and tool schema is pinned by SHA-256 lockfile; zero `npx -y` or `@latest` references in production configs.

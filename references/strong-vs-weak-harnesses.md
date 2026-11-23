@@ -1,6 +1,6 @@
 # Strong vs. Weak Agent Harnesses: Empirical Evidence, Boundaries & Diagnostics
 
-When an autonomous agent fails in production, teams reflexively swap in a larger model. Empirical benchmarks across Anthropic, LangChain, OpenAI, Vercel, Browser Use, Princeton, Manus, and UC Berkeley prove a sharper truth: **with model weights completely frozen, harness and Agent-Computer Interface (ACI) design swings accuracy by +10 to +64.6 percentage points and unit cost by up to 10×.**
+When an autonomous agent fails in production, teams reflexively swap in a larger model. Empirical benchmarks across Anthropic, LangChain, OpenAI, Vercel, Browser Use, Princeton, Manus, and UC Berkeley prove a sharper truth: **with model weights completely frozen, harness and Agent-Computer Interface (ACI) design swings accuracy by +10 to +61.6 percentage points and unit cost by up to 10×.**
 
 ## Table of Contents
 
@@ -22,7 +22,7 @@ Every result below holds model weights **100% constant** (`$0` training compute)
 |---|---|---|---|
 | **LangChain** (Feb 2026) | `gpt-5.2-codex` / Terminal-Bench 2.0 (89 tasks) | Added `LocalContext`, `PreCompletionChecklist` exit verify, `LoopDetection` per-file edit counter, time-budget alerts, `xhigh-high-xhigh` reasoning sandwich via automated trace analysis | **52.8% → 66.5% (+13.7 pts; Top 30 → Top 5)**. `xhigh`-only = 53.9% (timeouts), `high`-only = 63.6%, sandwich = 66.5%. |
 | **LangChain** (Apr 2026) | `GPT-5.3 Codex` & `Claude Opus 4.7` / τ²-bench | Replaced one-size-fits-all harness with declarative per-model `HarnessProfile`s (`apply_patch`/`shell_command` for Codex; `<tool_result_reflection>` for Opus 4.7) | **Codex: 33% → 53% (+20 pts)**; **Opus 4.7: 43% → 53% (+10 pts)**. |
-| **Can Bölük / Stencil** (Feb 2026) | **16 LLMs** / React mutation editing (180 tasks × 3 runs) | Swapped only the edit tool (`apply_patch`/`str_replace` → **Hashline** `line:hash\|` anchors) | **+15 pts avg** (beats `patch` in **14/16**). **Grok Code Fast 1: 6.7% → 68.3% (+64.6 pts / 10×, −49% tokens)**; **Grok 4 Fast: +17.4 pts (−61% output tokens)**; **DeepSeek V3.2: −5 pts** (proving model-harness coupling). |
+| **Can Bölük / Stencil** (Feb 2026) | **16 LLMs** / React mutation editing (180 tasks × 3 runs) | Swapped only the edit tool (`apply_patch`/`str_replace` → **Hashline** `line:hash\|` anchors) | **+15 pts avg** (beats `patch` in **14/16**). **Grok Code Fast 1: 6.7% → 68.3% (+61.6 pts / 10×, −49% tokens)**; **Grok 4 Fast: +17.4 pts (−61% output tokens)**; **DeepSeek V3.2: −5 pts** (proving model-harness coupling). |
 | **Princeton SWE-agent** (`arXiv:2405.15793`) | `GPT-4 Turbo` / SWE-bench Lite (300) | Replaced raw Shell-only with custom ACI: 100-line viewer, lint-gated range edit (`flake8` revert), summarized search (≤50 hits), last-5 obs collapse | **11.0% → 18.0% (+7.0 pts)** over Shell-only w/ demo (+10.7 pts w/o demo). Ablations: no linter **−3.0**, full-file viewer **−5.3**, IDE iterative search **−6.0** (worse than no search at 15.7%!). |
 | **Vercel `d0`** (Dec 2025) | `Claude Opus 4.5` / Text-to-SQL (Cube DSL) | Deleted ~80% of tools (17 bespoke SQL/schema tools → **2 primitives**: sandboxed bash + `ExecuteSQL` over clean Cube docs) | **80% → 100% (+20 pts)**, **3.5× faster** (`274.8s → 77.4s`), **−37% tokens**, **−42% steps**. Worst case: 724s/100 steps FAIL → 141s/19 steps PASS. |
 | **Browser Use 1.0** (Apr 2026) | Frontier LLMs / Browser automation | Replaced 24 click/type/scroll wrappers + 10 crash watchdogs with raw CDP + Python execution | **+14 to +33 pts** on identical models. |
@@ -172,7 +172,7 @@ async def run_bounded_loop(provider, hands, session_log, profile, *, max_turns: 
     raise RuntimeError(f"Budget exhausted after {max_turns} turns without verified completion.")
 ```
 
-**Strong Pattern (TypeScript strict ESM — equivalent loop guards):**
+**Strong Pattern (TypeScript strict ESM — equivalent loop guards, bounded spill & exit verification):**
 ```ts
 import { createHash } from "node:crypto";
 
@@ -180,9 +180,15 @@ export async function runBoundedLoop(
   provider: LLMProvider,
   hands: ExecutionHands,
   sessionLog: AppendOnlySessionLog,
-  opts: { model: string; staticTools: readonly Record<string, unknown>[]; maxTurns: number },
+  opts: {
+    model: string;
+    staticTools: readonly Record<string, unknown>[];
+    mutatingTools: ReadonlySet<string>;
+    maxTurns: number;
+  },
 ): Promise<string> {
   const repeats = new Map<string, number>();
+  let mutated = false;
 
   for (let turn = 1; turn <= opts.maxTurns; turn += 1) {
     const messages = deriveMessages(await sessionLog.readAll());
@@ -204,11 +210,25 @@ export async function runBoundedLoop(
       })),
     });
 
-    if (resp.toolCalls.length === 0) return resp.content;
+    if (resp.toolCalls.length === 0) {
+      if (mutated && !(await verifyWorkspace(hands))) {
+        await sessionLog.append("user_message", {
+          content: "Verification failed. Inspect the failing test output and fix before finishing.",
+        });
+        continue;
+      }
+      return resp.content;
+    }
 
     for (const call of resp.toolCalls) {
+      const sortedArgs = Object.keys(call.arguments)
+        .sort()
+        .reduce<Record<string, unknown>>((acc, k) => {
+          acc[k] = call.arguments[k];
+          return acc;
+        }, {});
       const key = createHash("sha256")
-        .update(`${call.name}:${JSON.stringify(call.arguments)}`)
+        .update(`${call.name}:${JSON.stringify(sortedArgs)}`)
         .digest("hex")
         .slice(0, 12);
       const count = (repeats.get(key) ?? 0) + 1;
@@ -219,15 +239,21 @@ export async function runBoundedLoop(
         content = `[LOOP GUARD] Identical call \`${call.name}\` repeated ${count}x. Pivot or escalate.`;
       } else {
         try {
-          content = await hands.execute(call.name, call.arguments, AbortSignal.timeout(30_000));
+          const raw = await hands.execute(call.name, call.arguments, AbortSignal.timeout(30_000));
+          content = capOrSpill(raw, 24_000);
+          mutated = mutated || opts.mutatingTools.has(call.name);
         } catch (err) {
-          content = `[TOOL ERROR] \`${call.name}\` failed: ${String(err)}. Adjust parameters before retrying.`;
+          if (err instanceof Error && err.name === "TimeoutError") {
+            content = `[TIMEOUT] \`${call.name}\` exceeded 30s. Narrow scope or split command.`;
+          } else {
+            content = `[TOOL ERROR] \`${call.name}\` failed: ${String(err)}. Adjust parameters before retrying.`;
+          }
         }
       }
       await sessionLog.append("tool_result", { tool_call_id: call.id, content });
     }
   }
-  throw new Error(`Budget exhausted after ${opts.maxTurns} turns.`);
+  throw new Error(`Budget exhausted after ${opts.maxTurns} turns without verified completion.`);
 }
 ```
 
@@ -245,7 +271,7 @@ Use this triage table when reading a failing trace (grounded in Chroma's 18-LLM 
 |---|---|---|---|
 | Agent endlessly pursues a hallucinated or impossible goal recorded earlier | **Context Poisoning** | Gemini 2.5 Pokémon poisoned `goals` state | Validate state externally; reset/overwrite poisoned goal artifacts; forbid unverified self-writes to trusted memory (`ASI06`). |
 | Past ~32k–100k tokens, agent stops planning and repeats prior actions verbatim | **Context Distraction** | Gemini 2.5 Pro >100k tokens; Databricks Llama 3.1 405B >32k | Prune old tool results (`CompactionEdit`), offload large payloads (`spill-policy`), or trigger clean context reset / `Discard-all`. |
-| Agent invokes irrelevant tools or fails schema validation frequently | **Context Confusion** | BFCL v3; GeoEngine Llama 3.1 8B failed at 46 tools, passed at 19 | Consolidate CRUD into workflow tools (<15 static tools), namespace clearly, or enable `defer_loading` Tool Search / Code Mode. |
+| Agent invokes irrelevant tools or fails schema validation frequently | **Context Confusion** | BFCL v3; GeoEngine Llama 3.1 8B failed at 46 tools, passed at 19 | Consolidate CRUD into workflow tools, namespace clearly, and enable lazy loading (`defer_loading` Tool Search / Code Mode) past `>10` MCP tools (Anthropic guidance; `audit_harness.py` `AH013` warns past `>15` static tools). |
 | Early wrong guess anchors later turns; agent never recovers | **Context Clash** | Microsoft/Salesforce sharded prompts: −39% avg; `o3` **98.1 → 64.1** | Isolate speculative exploration in subagents; verify assumptions against ground truth before writing conclusions into main history. |
 | Input cost jumps ~10× and TTFT spikes mid-run; `tokens_cached / tokens_in < 0.50` | **KV-Cache Collapse** | Manus: `$3.00` vs `$0.30/MTok` on Claude Sonnet | Freeze static prefix (`tools → system → messages`), remove head timestamps/UUIDs, `sort_keys=True`, lock `effort`/`budget_tokens`, mask instead of mutating tools. |
 
@@ -260,13 +286,13 @@ Clear every gate before shipping a harness to production. Each check maps direct
 | **1. Hard Loop Caps** | `while True` calling LLM/tools with no step, token, cost, or wall-clock cap | `AH001` (`ERROR`) | Step/token/wall-clock budget breach or ungraceful hang |
 | **2. Safe Execution** | `shell=True`, `os.system`, interpolated `exec`/`execSync`, or `eval()`/`new Function()` | `AH002`, `AH003` (`ERROR`) | Command execution anomalies / unexpected exit codes |
 | **3. Real Isolation** | Regex/string command blacklists instead of OS/container sandbox; writable host mounts, `privileged: true`, `docker.sock`, missing `network_mode: none` | `AH004`, `AH006` (`ERROR`) | Lethal Trifecta sequence (untrusted read → sensitive local path → outbound egress) |
-| **4. Credential Vaulting** | Hardcoded keys or passing raw `os.environ` / `process.env` into subprocess/sandbox | `AH005` (`ERROR`) | Secret leak pattern (`sk-`, `sk-ant-`, `AIza`, `AKIA`, `ghp_`, PEM, Bearer, signed URL params) |
+| **4. Credential Vaulting** | Hardcoded keys or passing raw `os.environ` / `process.env` into subprocess/sandbox | `AH005` (`ERROR`) | Secret leak pattern (`sk-`, `sk-ant-`, `AIza`, `AKIA`, `gh[pousr]_`, PEM PKCS#1/PKCS#8, Bearer, signed URL params incl. `access_token`) |
 | **5. Timeouts Everywhere** | Subprocess or HTTP/LLM calls without explicit timeout / `AbortSignal` | `AH007` (`WARN`) | Non-monotonic timestamps / stalled spans |
 | **6. Error Integrity** | `except Exception: pass` or `messages.pop()` erasing failed turns from context | `AH008` (`WARN`) | Orphan `tool_call` lacking matching `tool_result`; doom-loop repeats |
 | **7. Safe Retries** | Constant/zero-sleep retry loops or nested multi-layer retries ($3^5 = 243\times$ storms) | `AH009` (`WARN`) | Rapid unjittered retry bursts / duplicate mutations |
 | **8. KV-Cache Hygiene** | `datetime.now()`/`Date.now()`/`uuid4()` in system prompt prefix or `sort_keys=False` | `AH010` (`WARN`) | KV-cache hit ratio drop across turns $t \ge 2$ (`tokens_cached / tokens_in`) |
 | **9. Reasoning Contract** | Stripping `reasoning_content`/`thinking` or encoding tool results as `role="user"` | `AH011` (`WARN`) | OTel accounting violation (`input < cached` or `output < thinking`) / HTTP 400 |
 | **10. Bounded Outputs** | Returning raw `stdout`/files/HTTP bodies into context without truncation + disk spill | `AH012` (`WARN`) | Single `tool_result` exceeding token/char ceiling (tool output flood) |
-| **11. Tool Supply & Scale** | Unpinned MCP (`npx -y` / `@latest`) or >15 static tools without deferred loading | `AH013` (`WARN`) | High tool schema validation failure rate |
+| **11. Tool Supply & Scale** | Unpinned MCP (`npx -y` / `@latest`) or bloated static catalogs (recommend lazy loading past `>10` MCP tools per Anthropic guidance; `audit_harness.py` `AH013` triggers its static bloat warning at `>15` static tools) | `AH013` (`WARN`) | High tool schema validation failure rate |
 | **12. Async Hygiene** | Blocking `time.sleep`, `requests.*`, or sync `subprocess.run` inside `async def` | `AH014` (`WARN`) | Event-loop stalls / timeout cascades |
 | **13. Hardened Evals** | Unprotected LLM judge (no `{grader_nonce}`, no `temperature=0`, first-match regex) or `k=1` eval without `pass@k` / `pass^k` | `AH015` (`WARN`), `AH016` (`INFO`/`WARN`) | Unverified completion after mutation; invalid `pass@k` vs `pass^k` math or duplicate task IDs |

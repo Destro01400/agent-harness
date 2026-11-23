@@ -1,10 +1,17 @@
 /** Isolated multi-trial evaluation runner with exact pass@k, pass^k, Wilson CI, and --gold mode. */
 
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { AgentHarness, CheckpointStore, TraceWriter, createBudgetConfig, type RunResult } from "./harness.ts";
+import {
+  AgentHarness,
+  CheckpointStore,
+  TraceWriter,
+  createBudgetConfig,
+  type RunResult,
+} from "./harness.ts";
 import {
   MockProvider,
   canonicalJson,
@@ -12,39 +19,57 @@ import {
   type ModelResponse,
   type ToolCall,
 } from "./provider.ts";
-import { createDefaultTools } from "./tools.ts";
+import { createDefaultTools, writeFileAtomicAsync } from "./tools.ts";
 
-function comb(n: number, k: number): number {
-  if (k < 0 || k > n) return 0;
-  if (k === 0 || k === n) return 1;
-  const effectiveK = Math.min(k, n - k);
-  let result = 1;
-  for (let i = 1; i <= effectiveK; i += 1) {
-    result = (result * (n - effectiveK + i)) / i;
+function assertInteger(value: number, name: string): void {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new Error(`Parameter '${name}' must be an integer, got: ${String(value)}`);
   }
-  return Math.round(result);
 }
 
-/** Exact unbiased estimator for pass@k: 1 - C(n-c, k) / C(n, k). */
+/** Overflow-safe exact unbiased estimator for pass@k: 1 - prod((n - c - i) / (n - i)). */
 export function passAtK(n: number, c: number, k: number): number {
+  assertInteger(n, "n");
+  assertInteger(c, "c");
+  assertInteger(k, "k");
   if (n < 1 || k < 1 || k > n || c < 0 || c > n) {
     throw new Error(`Invalid parameters: n=${n}, c=${c}, k=${k}`);
   }
   if (n - c < k) return 1;
-  return 1 - comb(n - c, k) / comb(n, k);
+  let prod = 1;
+  for (let i = 0; i < k; i += 1) {
+    prod *= (n - c - i) / (n - i);
+  }
+  return 1 - prod;
 }
 
-/** Exact unbiased estimator for pass^k: C(c, k) / C(n, k). */
+/** Overflow-safe exact unbiased estimator for pass^k: prod((c - i) / (n - i)). */
 export function passPowK(n: number, c: number, k: number): number {
+  assertInteger(n, "n");
+  assertInteger(c, "c");
+  assertInteger(k, "k");
   if (n < 1 || k < 1 || k > n || c < 0 || c > n) {
     throw new Error(`Invalid parameters: n=${n}, c=${c}, k=${k}`);
   }
   if (c < k) return 0;
-  return comb(c, k) / comb(n, k);
+  let prod = 1;
+  for (let i = 0; i < k; i += 1) {
+    prod *= (c - i) / (n - i);
+  }
+  return prod;
 }
 
 /** Wilson score 95% confidence interval for a binomial proportion. */
-export function wilsonCi(successes: number, total: number, z = 1.959963984540054): [number, number] {
+export function wilsonCi(
+  successes: number,
+  total: number,
+  z = 1.959963984540054,
+): [number, number] {
+  assertInteger(successes, "successes");
+  assertInteger(total, "total");
+  if (typeof z !== "number" || !Number.isFinite(z) || z <= 0) {
+    throw new Error(`Invalid z value: ${String(z)}`);
+  }
   if (total < 1 || successes < 0 || successes > total) {
     throw new Error(`Invalid Wilson CI inputs: successes=${successes}, total=${total}`);
   }
@@ -68,8 +93,8 @@ export interface EvalTask {
   }[];
 }
 
-export function loadTasks(filePath: string): EvalTask[] {
-  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+function parseTasksText(rawText: string): EvalTask[] {
+  const lines = rawText.replace(/^\uFEFF/, "").split(/\r?\n/);
   const tasks: EvalTask[] = [];
   const seen = new Set<string>();
   for (let i = 0; i < lines.length; i += 1) {
@@ -86,12 +111,22 @@ export function loadTasks(filePath: string): EvalTask[] {
   return tasks;
 }
 
+export function loadTasks(filePath: string): EvalTask[] {
+  return parseTasksText(fs.readFileSync(filePath, "utf8"));
+}
+
+async function loadTasksAsync(filePath: string): Promise<EvalTask[]> {
+  const text = await fsp.readFile(filePath, "utf8");
+  return parseTasksText(text);
+}
+
 export function gradeOutcome(
   task: EvalTask,
   result: RunResult,
   workspace: string,
 ): { passed: boolean; failures: string[] } {
   const failures: string[] = [];
+  const wsReal = fs.realpathSync(path.resolve(workspace));
   for (const grader of task.graders) {
     const type = String(grader.type ?? "");
     if (type === "contains") {
@@ -107,11 +142,71 @@ export function gradeOutcome(
     } else if (type === "file_contains") {
       const relPath = String(grader.path ?? "");
       const value = String(grader.value ?? "");
-      const fullPath = path.join(workspace, relPath);
-      if (!fs.existsSync(fullPath)) {
+      const fullPath = path.resolve(wsReal, relPath);
+      const rel = path.relative(wsReal, fullPath);
+      if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+        failures.push(`file_contains failed: path '${relPath}' escapes workspace`);
+      } else if (!fs.existsSync(fullPath)) {
         failures.push(`file_contains failed: missing file ${relPath}`);
       } else if (!fs.readFileSync(fullPath, "utf8").includes(value)) {
         failures.push(`file_contains failed: ${relPath} missing '${value}'`);
+      }
+    } else if (type === "tool_used") {
+      const name = String(grader.name ?? "");
+      if (!result.toolCallsMade.includes(name)) {
+        failures.push(`tool_used failed: ${name} was never invoked`);
+      }
+    } else if (type === "max_steps") {
+      const limit = Number(grader.limit ?? 0);
+      if (result.steps > limit) {
+        failures.push(`max_steps failed: ${result.steps} > ${limit}`);
+      }
+    } else {
+      failures.push(`unknown grader type: '${type}'`);
+    }
+  }
+  return { passed: failures.length === 0, failures };
+}
+
+async function gradeOutcomeAsync(
+  task: EvalTask,
+  result: RunResult,
+  workspace: string,
+): Promise<{ passed: boolean; failures: string[] }> {
+  const failures: string[] = [];
+  const wsReal = await fsp.realpath(path.resolve(workspace));
+  for (const grader of task.graders) {
+    const type = String(grader.type ?? "");
+    if (type === "contains") {
+      const value = String(grader.value ?? "");
+      if (!result.finalOutput.includes(value)) {
+        failures.push(`contains failed: missing '${value}'`);
+      }
+    } else if (type === "regex") {
+      const pattern = String(grader.pattern ?? "");
+      if (!new RegExp(pattern).test(result.finalOutput)) {
+        failures.push(`regex failed: pattern '${pattern}' not matched`);
+      }
+    } else if (type === "file_contains") {
+      const relPath = String(grader.path ?? "");
+      const value = String(grader.value ?? "");
+      const fullPath = path.resolve(wsReal, relPath);
+      const rel = path.relative(wsReal, fullPath);
+      if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+        failures.push(`file_contains failed: path '${relPath}' escapes workspace`);
+      } else {
+        try {
+          const text = await fsp.readFile(fullPath, "utf8");
+          if (!text.includes(value)) {
+            failures.push(`file_contains failed: ${relPath} missing '${value}'`);
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+            failures.push(`file_contains failed: missing file ${relPath}`);
+          } else {
+            throw err;
+          }
+        }
       }
     } else if (type === "tool_used") {
       const name = String(grader.name ?? "");
@@ -178,11 +273,11 @@ export async function runEvalSuite(
 ): Promise<EvalSummary> {
   const trials = options.trials ?? 3;
   const gold = options.gold ?? false;
-  if (trials < 1) {
-    throw new Error("trials must be >= 1");
+  if (typeof trials !== "number" || !Number.isInteger(trials) || trials < 1) {
+    throw new Error(`trials must be an integer >= 1, got: ${String(trials)}`);
   }
 
-  const tasks = loadTasks(tasksPath);
+  const tasks = await loadTasksAsync(tasksPath);
   const taskReports: Record<string, unknown>[] = [];
   let totalPasses = 0;
   let totalTrials = 0;
@@ -190,14 +285,14 @@ export async function runEvalSuite(
   for (const task of tasks) {
     const trialResults: Record<string, unknown>[] = [];
     for (let trialIdx = 1; trialIdx <= trials; trialIdx += 1) {
-      const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), `eval_${task.id}_t${trialIdx}_`));
+      const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), `eval_${task.id}_t${trialIdx}_`));
       try {
         const workspace = path.join(tmpRoot, "workspace");
-        fs.mkdirSync(workspace, { recursive: true });
+        await fsp.mkdir(workspace, { recursive: true });
         for (const [relPath, content] of Object.entries(task.setup_files ?? {})) {
           const dest = path.join(workspace, relPath);
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.writeFileSync(dest, content, "utf8");
+          await fsp.mkdir(path.dirname(dest), { recursive: true });
+          await fsp.writeFile(dest, content, "utf8");
         }
 
         const harness = new AgentHarness({
@@ -214,7 +309,7 @@ export async function runEvalSuite(
         });
 
         const result = await harness.run(task.input);
-        const graded = gradeOutcome(task, result, workspace);
+        const graded = await gradeOutcomeAsync(task, result, workspace);
         trialResults.push({
           failures: graded.failures,
           passed: graded.passed,
@@ -223,7 +318,7 @@ export async function runEvalSuite(
           trial: trialIdx,
         });
       } finally {
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        await fsp.rm(tmpRoot, { recursive: true, force: true });
       }
     }
 
@@ -263,37 +358,98 @@ export async function runEvalSuite(
   };
 }
 
-async function main(): Promise<number> {
-  const args = process.argv.slice(2);
+export interface ParsedCliArgs {
+  readonly help: boolean;
+  readonly tasksPath: string;
+  readonly trials: number;
+  readonly gold: boolean;
+  readonly outputPath: string | null;
+}
+
+const USAGE_TEXT = [
+  "Usage: node src/eval_runner.ts [options]",
+  "",
+  "Options:",
+  "  --tasks <path>    Path to tasks JSONL file (default: evals/tasks.jsonl)",
+  "  --trials <int>    Positive integer number of trials per task (default: 3)",
+  "  --gold            Verify task/grader soundness using deterministic gold plans",
+  "  --output <path>   Optional path to write JSON summary",
+  "  -h, --help        Show this help message and exit",
+].join("\n");
+
+export function parseCliArgs(args: readonly string[]): ParsedCliArgs {
+  let help = false;
   let tasksPath = path.resolve("evals/tasks.jsonl");
   let trials = 3;
   let gold = false;
   let outputPath: string | null = null;
 
   for (let i = 0; i < args.length; i += 1) {
-    const token = args[i];
-    if (token === "--tasks" && args[i + 1]) {
-      tasksPath = path.resolve(args[i + 1]!);
+    const token = args[i]!;
+    if (token === "--help" || token === "-h") {
+      help = true;
+    } else if (token === "--tasks") {
+      const value = args[i + 1];
+      if (!value || value.startsWith("-")) {
+        throw new Error("Option '--tasks' requires a file path argument.");
+      }
+      tasksPath = path.resolve(value);
       i += 1;
-    } else if (token === "--trials" && args[i + 1]) {
-      trials = Number.parseInt(args[i + 1]!, 10);
+    } else if (token === "--trials") {
+      const raw = args[i + 1];
+      if (raw === undefined) {
+        throw new Error("Option '--trials' requires a positive integer argument.");
+      }
+      const parsed = Number.parseInt(raw, 10);
+      if (!/^\d+$/.test(raw) || !Number.isInteger(parsed) || parsed < 1) {
+        throw new Error(
+          `Invalid --trials value '${raw}'. Expected a positive integer >= 1.`,
+        );
+      }
+      trials = parsed;
       i += 1;
     } else if (token === "--gold") {
       gold = true;
-    } else if (token === "--output" && args[i + 1]) {
-      outputPath = path.resolve(args[i + 1]!);
+    } else if (token === "--output") {
+      const value = args[i + 1];
+      if (!value || value.startsWith("-")) {
+        throw new Error("Option '--output' requires a file path argument.");
+      }
+      outputPath = path.resolve(value);
       i += 1;
+    } else {
+      throw new Error(`Unknown option or argument: '${token}'. Run with --help for usage.`);
     }
   }
 
-  const summary = await runEvalSuite(tasksPath, { trials, gold });
+  return { help, tasksPath, trials, gold, outputPath };
+}
+
+export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
+  let parsed: ParsedCliArgs;
+  try {
+    parsed = parseCliArgs(argv);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Error: ${msg}\n${USAGE_TEXT}\n`);
+    return 2;
+  }
+
+  if (parsed.help) {
+    process.stdout.write(`${USAGE_TEXT}\n`);
+    return 0;
+  }
+
+  const summary = await runEvalSuite(parsed.tasksPath, {
+    trials: parsed.trials,
+    gold: parsed.gold,
+  });
   const rendered = canonicalJson(summary, 2);
-  if (outputPath) {
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, `${rendered}\n`, "utf8");
+  if (parsed.outputPath) {
+    await writeFileAtomicAsync(parsed.outputPath, `${rendered}\n`);
   }
   process.stdout.write(`${rendered}\n`);
-  return gold && !summary.gold_verified ? 1 : 0;
+  return parsed.gold && !summary.gold_verified ? 1 : 0;
 }
 
 const isMain =

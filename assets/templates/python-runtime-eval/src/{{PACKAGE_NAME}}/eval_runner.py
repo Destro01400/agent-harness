@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import re
 import tempfile
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from {{PACKAGE_NAME}}.harness import AgentHarness, BudgetConfig, CheckpointStore, RunResult, TraceWriter
-from {{PACKAGE_NAME}}.provider import HarnessProfile, Message, MockProvider, ModelResponse, ToolCall, Usage
+from {{PACKAGE_NAME}}.provider import HarnessProfile, MockProvider, ModelResponse, ToolCall, Usage
 from {{PACKAGE_NAME}}.tools import create_default_tools
 
 
@@ -60,7 +61,7 @@ class EvalTask:
 def load_tasks(path: Path) -> list[EvalTask]:
     tasks: list[EvalTask] = []
     seen_ids: set[str] = set()
-    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
         stripped = raw_line.strip()
         if not stripped:
             continue
@@ -85,6 +86,7 @@ def load_tasks(path: Path) -> list[EvalTask]:
 def grade_outcome(task: EvalTask, result: RunResult, workspace: Path) -> tuple[bool, list[str]]:
     """Evaluate final outcome (text, workspace artifacts, and invariants) deterministically."""
     failures: list[str] = []
+    ws_real = Path(os.path.realpath(workspace))
     for grader in task.graders:
         gtype = grader.get("type")
         if gtype == "contains":
@@ -98,8 +100,14 @@ def grade_outcome(task: EvalTask, result: RunResult, workspace: Path) -> tuple[b
         elif gtype == "file_contains":
             rel_path = str(grader["path"])
             needle = str(grader["value"])
-            target = workspace / rel_path
-            if not target.exists():
+            target = Path(os.path.realpath(ws_real / rel_path))
+            try:
+                contained = os.path.commonpath([str(ws_real), str(target)]) == str(ws_real)
+            except ValueError:
+                contained = False
+            if not contained:
+                failures.append(f"file_contains failed: path {rel_path!r} escapes workspace")
+            elif not target.exists():
                 failures.append(f"file_contains failed: missing file {rel_path}")
             elif needle not in target.read_text(encoding="utf-8"):
                 failures.append(f"file_contains failed: {rel_path} missing {needle!r}")
@@ -153,16 +161,20 @@ def _build_scripted_provider(task: EvalTask, *, gold: bool) -> MockProvider:
     return MockProvider(responses=responses)
 
 
+def _prepare_workspace(workspace: Path, setup_files: dict[str, str]) -> None:
+    workspace.mkdir(parents=True, exist_ok=True)
+    for rel_path, content in setup_files.items():
+        dest = workspace / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+
+
 async def run_single_trial(task: EvalTask, trial_index: int, *, gold: bool) -> dict[str, Any]:
     """Run one task trial in an isolated temporary workspace with its own trace and checkpoints."""
     with tempfile.TemporaryDirectory(prefix=f"eval_{task.id}_t{trial_index}_") as tmp:
         root = Path(tmp)
         workspace = root / "workspace"
-        workspace.mkdir(parents=True, exist_ok=True)
-        for rel_path, content in task.setup_files.items():
-            dest = workspace / rel_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content, encoding="utf-8")
+        await asyncio.to_thread(_prepare_workspace, workspace, task.setup_files)
 
         provider = _build_scripted_provider(task, gold=gold)
         tools = create_default_tools(workspace)
@@ -181,7 +193,7 @@ async def run_single_trial(task: EvalTask, trial_index: int, *, gold: bool) -> d
             spill_dir=root / "spills",
         )
         result = await harness.run(task.input)
-        passed, failures = grade_outcome(task, result, workspace)
+        passed, failures = await asyncio.to_thread(grade_outcome, task, result, workspace)
         return {
             "failures": failures,
             "passed": passed,
@@ -197,9 +209,9 @@ async def run_eval_suite(
     trials: int = 3,
     gold: bool = False,
 ) -> dict[str, Any]:
-    if trials < 1:
-        raise ValueError("trials must be >= 1")
-    tasks = load_tasks(tasks_path)
+    if isinstance(trials, bool) or not isinstance(trials, int) or trials < 1:
+        raise ValueError("trials must be an integer >= 1")
+    tasks = await asyncio.to_thread(load_tasks, tasks_path)
     task_reports: list[dict[str, Any]] = []
     total_passes = 0
     total_trials = 0
@@ -246,10 +258,20 @@ async def run_eval_suite(
     }
 
 
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected integer >= 1, got {raw!r}") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"Expected integer >= 1, got {value}")
+    return value
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run isolated multi-trial evaluations for {{PROJECT_NAME}}.")
     parser.add_argument("--tasks", type=Path, default=Path("evals/tasks.jsonl"))
-    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--trials", type=_positive_int, default=3)
     parser.add_argument("--gold", action="store_true", help="Verify tasks/graders with gold plans")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write JSON summary")
     args = parser.parse_args(argv)

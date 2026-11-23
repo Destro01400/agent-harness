@@ -129,12 +129,14 @@ async def call_with_single_layer_retry(
 ```typescript
 export class RetryBudget {
   private tokens: number;
+  private readonly maxTokens: number;
+  private readonly successDeposit: number;
+  private readonly retryCost: number;
 
-  constructor(
-    private readonly maxTokens = 100,
-    private readonly successDeposit = 1,
-    private readonly retryCost = 10,
-  ) {
+  constructor(maxTokens = 100, successDeposit = 1, retryCost = 10) {
+    this.maxTokens = maxTokens;
+    this.successDeposit = successDeposit;
+    this.retryCost = retryCost;
     this.tokens = maxTokens;
   }
 
@@ -150,12 +152,12 @@ export class RetryBudget {
 }
 
 export class RetryableError extends Error {
-  constructor(
-    message: string,
-    public readonly retryAfterMs?: number,
-  ) {
+  public readonly retryAfterMs?: number;
+
+  constructor(message: string, retryAfterMs?: number) {
     super(message);
     this.name = "RetryableError";
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -243,7 +245,7 @@ AWS Builders' Library (*Making retries safe with idempotent APIs*) establishes f
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass(frozen=True)
@@ -309,31 +311,48 @@ Cancellation (`SIGINT`, `SIGTERM`, user abort, or `time_limit` / `working_limit`
 ```python
 import asyncio
 import contextlib
+import os
+import signal
 
 
-async def run_cancellable_command(argv: list[str], *, timeout_s: float) -> tuple[int, str, str]:
-    """Run a subprocess with timeout and guaranteed kill/reap on asyncio cancellation."""
+def _terminate_process_tree(proc: asyncio.subprocess.Process, *, force: bool = False) -> None:
+    """Signal the entire process group on POSIX; fall back to terminate/kill on Windows."""
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        if os.name == "posix":
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            os.killpg(os.getpgid(proc.pid), sig)
+        elif force:
+            proc.kill()
+        else:
+            proc.terminate()
+
+
+async def run_cancellable_command(
+    argv: list[str], *, timeout_s: float, grace_s: float = 3.0
+) -> tuple[int, str, str]:
+    """Run a subprocess with timeout and guaranteed process-group teardown on cancellation."""
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=(os.name == "posix"),
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         return proc.returncode or 0, stdout_b.decode("utf-8", "replace"), stderr_b.decode("utf-8", "replace")
     except (TimeoutError, asyncio.CancelledError):
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
+        _terminate_process_tree(proc, force=False)
         try:
-            await asyncio.wait_for(proc.wait(), timeout=3.0)
+            await asyncio.wait_for(proc.wait(), timeout=grace_s)
         except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+            _terminate_process_tree(proc, force=True)
             await proc.wait()
         raise
 ```
 
-### TypeScript (strict ESM) — Composed `AbortSignal` Timeout + Subprocess Cleanup
+### TypeScript (strict ESM) — Composed `AbortSignal` Timeout, Bounded Output & `SIGKILL` Escalation
 
 ```typescript
 import { spawn } from "node:child_process";
@@ -341,23 +360,70 @@ import { spawn } from "node:child_process";
 export async function runCancellableCommand(
   cmd: string,
   args: readonly string[],
-  opts: { timeoutMs: number; signal?: AbortSignal },
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  opts: { timeoutMs: number; graceMs?: number; maxOutputChars?: number; signal?: AbortSignal },
+): Promise<{ exitCode: number; stdout: string; stderr: string; truncated: boolean }> {
+  const graceMs = opts.graceMs ?? 3_000;
+  const maxOutputChars = opts.maxOutputChars ?? 65_536;
   const combined = opts.signal
     ? AbortSignal.any([opts.signal, AbortSignal.timeout(opts.timeoutMs)])
     : AbortSignal.timeout(opts.timeoutMs);
+
+  combined.throwIfAborted();
 
   return await new Promise((resolve, reject) => {
     const child = spawn(cmd, [...args], { stdio: ["ignore", "pipe", "pipe"], signal: combined });
     let stdout = "";
     let stderr = "";
+    let truncated = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const appendBounded = (buf: string, chunk: string): string => {
+      const remaining = maxOutputChars - buf.length;
+      if (remaining <= 0) {
+        truncated = true;
+        return buf;
+      }
+      if (chunk.length > remaining) {
+        truncated = true;
+        return buf + chunk.slice(0, remaining);
+      }
+      return buf + chunk;
+    };
+
+    const onAbort = (): void => {
+      // Escalate to SIGKILL if child ignores SIGTERM sent by AbortSignal.
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
+      }, graceMs);
+      killTimer.unref();
+    };
+
+    const cleanup = (): void => {
+      if (killTimer !== undefined) clearTimeout(killTimer);
+      combined.removeEventListener("abort", onAbort);
+    };
+
+    combined.addEventListener("abort", onAbort, { once: true });
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
-    child.on("error", reject);
+    child.stdout.on("data", (chunk: string) => {
+      stdout = appendBounded(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr = appendBounded(stderr, chunk);
+    });
+    child.on("exit", () => {
+      if (killTimer !== undefined) clearTimeout(killTimer);
+    });
+    child.on("error", (err) => {
+      combined.removeEventListener("abort", onAbort);
+      reject(err);
+    });
     child.on("close", (code) => {
-      resolve({ exitCode: code ?? -1, stdout, stderr });
+      cleanup();
+      resolve({ exitCode: code ?? -1, stdout, stderr, truncated });
     });
   });
 }
@@ -413,6 +479,7 @@ export type HarnessStreamEvent =
   | { readonly type: "text_delta"; readonly settled: false; readonly delta: string }
   | { readonly type: "thinking_delta"; readonly settled: false; readonly delta: string }
   | { readonly type: "tool_call_delta"; readonly settled: false; readonly callId: string; readonly delta: string }
+  | { readonly type: "tool_execution_started"; readonly settled: false; readonly callId: string; readonly toolName: string }
   | { readonly type: "tool_result"; readonly settled: true; readonly seq: number; readonly callId: string; readonly isError: boolean; readonly content: string }
   | { readonly type: "turn_committed"; readonly settled: true; readonly seq: number; readonly tokensIn: number; readonly tokensCached: number; readonly tokensOut: number; readonly finishReason: string }
   | { readonly type: "approval_required"; readonly settled: true; readonly callId: string; readonly toolName: string; readonly riskSummary: string }

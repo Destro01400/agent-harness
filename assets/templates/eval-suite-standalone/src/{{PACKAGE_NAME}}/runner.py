@@ -1,4 +1,4 @@
-"""Concurrency-bounded multi-trial eval runner with pass@k, pass^k, Wilson CI, and baseline gate."""
+"""Concurrency-bounded multi-trial eval runner with pass@k, pass^k, Wilson CI, clustered SE, and baseline gate."""
 
 from __future__ import annotations
 
@@ -51,6 +51,29 @@ def wilson_ci(successes: int, total: int, z: float = 1.959963984540054) -> tuple
     return max(0.0, center - half), min(1.0, center + half)
 
 
+def clustered_stderr(task_rates: Sequence[float]) -> float:
+    """Task-clustered standard error across per-task pass rates (accounts for repeated-trial correlation)."""
+    g = len(task_rates)
+    if g < 2:
+        return 0.0
+    values: list[float] = []
+    for rate in task_rates:
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate):
+            raise ValueError(f"Invalid task rate: {rate!r}")
+        values.append(float(rate))
+    mean = sum(values) / g
+    sum_sq = sum((r - mean) ** 2 for r in values)
+    return math.sqrt(sum_sq / (g * (g - 1)))
+
+
+def _setup_workspace(workspace: Path, setup_files: dict[str, str]) -> None:
+    workspace.mkdir(parents=True, exist_ok=True)
+    for rel_path, content in setup_files.items():
+        dest = workspace / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+
+
 async def _execute_isolated_trial(
     adapter: AgentAdapter,
     task: EvalTask,
@@ -61,11 +84,7 @@ async def _execute_isolated_trial(
     async with semaphore:
         with tempfile.TemporaryDirectory(prefix=f"suite_{task.id}_t{trial_index}_") as tmp:
             workspace = Path(tmp) / "workspace"
-            workspace.mkdir(parents=True, exist_ok=True)
-            for rel_path, content in task.setup_files.items():
-                dest = workspace / rel_path
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(content, encoding="utf-8")
+            await asyncio.to_thread(_setup_workspace, workspace, task.setup_files)
 
             try:
                 trial_result = await asyncio.wait_for(
@@ -89,7 +108,7 @@ async def _execute_isolated_trial(
                     error=f"Adapter error ({type(exc).__name__}): {exc}",
                 )
 
-            passed, outcomes = grade_trial(task, trial_result, workspace)
+            passed, outcomes = await asyncio.to_thread(grade_trial, task, trial_result, workspace)
             return {
                 "duration_ms": round(trial_result.duration_ms, 2),
                 "error": trial_result.error,
@@ -113,14 +132,14 @@ async def run_eval_suite(
     gold: bool = False,
 ) -> dict[str, Any]:
     """Run all tasks across k trials with bounded concurrency and isolated temp workspaces."""
-    if trials < 1:
-        raise ValueError("trials must be >= 1")
-    if max_concurrency < 1:
-        raise ValueError("max_concurrency must be >= 1")
+    if isinstance(trials, bool) or not isinstance(trials, int) or trials < 1:
+        raise ValueError("trials must be an integer >= 1")
+    if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
+        raise ValueError("max_concurrency must be an integer >= 1")
     if trial_timeout_s <= 0:
         raise ValueError("trial_timeout_s must be > 0")
 
-    tasks = load_tasks(tasks_path)
+    tasks = await asyncio.to_thread(load_tasks, tasks_path)
     active_adapter: AgentAdapter = (
         GoldReferenceAdapter() if gold else (adapter if adapter is not None else DemoAdapter())
     )
@@ -162,11 +181,14 @@ async def run_eval_suite(
         )
 
     agg_low, agg_high = wilson_ci(total_passes, total_trials) if total_trials else (0.0, 0.0)
+    task_rates = [t["passed_trials"] / t["total_trials"] for t in task_reports]
+    se_cluster = clustered_stderr(task_rates)
     mean_at_1 = sum(t["pass_at_1"] for t in task_reports) / len(task_reports) if task_reports else 0.0
     mean_at_k = sum(t["pass_at_k"] for t in task_reports) / len(task_reports) if task_reports else 0.0
     mean_pow_k = sum(t["pass_pow_k"] for t in task_reports) / len(task_reports) if task_reports else 0.0
 
     return {
+        "clustered_stderr": round(se_cluster, 6),
         "gold_mode": gold,
         "gold_verified": gold and all(t["gold_verified"] for t in task_reports),
         "pass_at_1": round(mean_at_1, 6),
@@ -222,18 +244,21 @@ def compare_baseline(
                 }
             )
             continue
-        base_rate = float(base_task.get("pass_at_1", 0.0))
-        curr_rate = float(curr_task.get("pass_at_1", 0.0))
-        if base_rate - curr_rate > max_drop + 1e-9:
-            regressions.append(
-                {
-                    "baseline": base_rate,
-                    "current": curr_rate,
-                    "delta": round(curr_rate - base_rate, 6),
-                    "metric": "pass_at_1",
-                    "scope": task_id,
-                }
-            )
+        for metric in ("pass_at_1", "pass_pow_k"):
+            if metric not in base_task:
+                continue
+            base_rate = float(base_task.get(metric, 0.0))
+            curr_rate = float(curr_task.get(metric, 0.0))
+            if base_rate - curr_rate > max_drop + 1e-9:
+                regressions.append(
+                    {
+                        "baseline": base_rate,
+                        "current": curr_rate,
+                        "delta": round(curr_rate - base_rate, 6),
+                        "metric": metric,
+                        "scope": task_id,
+                    }
+                )
 
     return {
         "max_allowed_drop": max_drop,
@@ -247,12 +272,13 @@ def render_markdown_report(
     gate: dict[str, Any] | None = None,
 ) -> str:
     """Render a compact Markdown report suitable for PR comments and CI artifacts."""
+    se_val = float(summary.get("clustered_stderr", 0.0))
     lines = [
         "# Evaluation Summary",
         "",
         f"- **Tasks:** {summary['task_count']} | **Trials/task:** {summary['trials_per_task']} | **Gold mode:** `{summary['gold_mode']}`",
         f"- **pass@1:** `{summary['pass_at_1']:.3f}` | **pass@k:** `{summary['pass_at_k']:.3f}` | **pass^k:** `{summary['pass_pow_k']:.3f}`",
-        f"- **Aggregate Wilson 95% CI:** `[{summary['wilson_ci_95'][0]:.3f}, {summary['wilson_ci_95'][1]:.3f}]`",
+        f"- **Aggregate Wilson 95% CI:** `[{summary['wilson_ci_95'][0]:.3f}, {summary['wilson_ci_95'][1]:.3f}]` | **Clustered SE:** `{se_val:.4f}`",
     ]
     if gate is not None:
         status = "PASS" if gate["passed"] else "FAIL"
@@ -280,11 +306,21 @@ def render_markdown_report(
     return "\n".join(lines) + "\n"
 
 
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected integer >= 1, got {raw!r}") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"Expected integer >= 1, got {value}")
+    return value
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run standalone agent evaluation suite.")
     parser.add_argument("--tasks", type=Path, default=Path("datasets/tasks.jsonl"))
-    parser.add_argument("--trials", type=int, default=3)
-    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--trials", type=_positive_int, default=3)
+    parser.add_argument("--concurrency", type=_positive_int, default=4)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--gold", action="store_true", help="Verify graders using gold reference adapter")
     parser.add_argument("--baseline", type=Path, default=None, help="Path to baseline.json for regression gate")
@@ -305,7 +341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     gate: dict[str, Any] | None = None
     if args.baseline is not None:
-        baseline_data = json.loads(args.baseline.read_text(encoding="utf-8"))
+        baseline_data = json.loads(args.baseline.read_text(encoding="utf-8-sig"))
         gate = compare_baseline(summary, baseline_data, max_drop=args.max_drop)
         summary["baseline_gate"] = gate
 

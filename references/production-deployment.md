@@ -198,6 +198,7 @@ export interface KillSwitchStore {
 export class LazyHandsDispatcher {
   private sandbox: SandboxHandle | null = null;
   private provisioning: Promise<SandboxHandle> | null = null;
+  private disposed = false;
   private readonly provisionSandbox: () => Promise<SandboxHandle>;
   private readonly killSwitch: KillSwitchStore;
 
@@ -207,12 +208,26 @@ export class LazyHandsDispatcher {
   }
 
   private async ensureSandbox(): Promise<SandboxHandle> {
+    if (this.disposed) {
+      throw new Error("LazyHandsDispatcher has been disposed.");
+    }
     if (this.sandbox) return this.sandbox;
     if (!this.provisioning) {
-      this.provisioning = this.provisionSandbox().then((handle) => {
-        this.sandbox = handle;
-        return handle;
-      });
+      const pending: Promise<SandboxHandle> = this.provisionSandbox()
+        .then(async (handle) => {
+          if (this.disposed) {
+            await handle.dispose();
+            throw new Error("LazyHandsDispatcher was disposed during sandbox provisioning.");
+          }
+          this.sandbox = handle;
+          return handle;
+        })
+        .finally(() => {
+          if (this.provisioning === pending) {
+            this.provisioning = null;
+          }
+        });
+      this.provisioning = pending;
     }
     return this.provisioning;
   }
@@ -236,10 +251,17 @@ export class LazyHandsDispatcher {
   }
 
   public async cleanup(): Promise<void> {
+    this.disposed = true;
+    const pending = this.provisioning;
     const handle = this.sandbox;
     this.sandbox = null;
     this.provisioning = null;
-    if (handle) await handle.dispose();
+    if (pending) {
+      await pending.catch(() => undefined);
+    }
+    if (handle) {
+      await handle.dispose();
+    }
   }
 }
 ```

@@ -22,14 +22,14 @@ Three empirical benchmarks define the coding ACI frontier—holding model weight
 Can Bölük / Stencil (Feb 2026) benchmarked **16 LLMs** (180 React edit tasks × 3 runs) changing **only the edit tool**:
 - `str_replace` fails constantly on exact whitespace/indentation reproduction.
 - Raw `apply_patch` produced **46.2%–50.7% patch failure rates** on models not post-trained on OpenAI diffs (`GLM-4.7`, `Grok 4 Fast`).
-- **Hashline** tags every line returned by `read`/`grep` with a short 2–3 character content hash (`42:f1|  return value;`). To edit, the model cites only anchor tags (`replace(start="42:f1", end="45:a9", new_lines=...)`) without reproducing existing text. If the file shifted since reading, the hash check **optimistically rejects stale edits** before corrupting code.
+- **Hashline** tags every line returned by `read`/`grep` with a short 2–3 hex character content hash (e.g., via `blake2` or `sha256`: `42:f1|  return value;`). To edit, the model cites only anchor tags (`replace(start="42:f1", end="45:a9", new_lines=...)`) without reproducing existing text. If the file shifted since reading, the hash check **optimistically rejects stale edits** before corrupting code.
 - **Measured impact:** **+15 pts average** over `patch` across 16 models (`14/16` improved; `Grok Code Fast 1` **6.7% → 68.3% / 10×, −49% tokens**; `Grok 4 Fast` **+17.4 pts, −61% output tokens**; `Claude Sonnet 4.5` **+14.4 pts, −24% tokens**).
 - **Model-coupling caveat:** `DeepSeek V3.2` dropped **−5 pts vs `patch` / −8.3 pts vs `str_replace`**—proving edit-tool format MUST live in a declarative per-model **`HarnessProfile`** (LangChain τ²-bench lifted `GPT-5.3 Codex` **+20 pts** by swapping `edit_file → apply_patch` + `execute → shell_command`).
 
 ### B. SWE-agent ACI Ablations (`arXiv:2405.15793`)
 Replacing raw Linux shell with a custom ACI on `GPT-4 Turbo` lifted SWE-bench Lite from **11.0% → 18.0% (+7.0 pts)**—and component ablations revealed exact design rules:
 - **100-line windowed file viewer (`18.0%`):** Peaked at 100 lines. Shrinking to 30 lines dropped to **14.3% (−3.7)** (too fragmented); dumping full files dropped to **12.7% (−5.3)** (context dilution).
-- **Lint-gated range edit (`edit <start>:<end>`):** Runs fast syntax/lint check (`py_compile`/`flake8`/`tsc`) *before committing*; if syntax fails, **reverts the edit immediately** and returns the exact lint error + context. Removing the linter dropped **−3.0 pts** (cascading edit errors caused 23.4% of all unresolved runs).
+- **Lint-gated range edit (`edit <start>:<end>`):** Runs fast syntax/lint check (`ast.parse`/`flake8`/`tsc`) *before committing*; if syntax fails, **reverts the edit immediately** and returns the exact lint error + context. Removing the linter dropped **−3.0 pts** (cascading edit errors caused 23.4% of all unresolved runs).
 - **Summarized search capped at $\le 50$ hits (`18.0%`):** IDE-style iterative `next`/`prev` search scored **12.0% (−6.0)**—**worse than having no search tool at all (15.7%)**—because agents exhaustively stepped through matches and blew their step budget. Return counts per file and steer the agent to narrow queries over 50 hits.
 - **Explicit empty-output message:** Never return `""` when a command succeeds silently; return `"Command succeeded with no output (exit code 0)"` so the model does not assume a hang.
 - **Mandatory absolute paths:** Anthropic's SWE-bench experience showed requiring absolute filepaths eliminated navigation errors after working-directory changes.
@@ -126,14 +126,16 @@ High-throughput coding agents replicate whatever patterns already exist in a cod
 ### Python Pattern: Hashline Reader & Syntax-Gated Atomic Editor
 
 ```python
+import ast
 import hashlib
-import py_compile
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 
 def _line_hash(line: str) -> str:
+    """Short 2-3 hex char content hash (blake2/sha256); keep algorithm & width identical across read/edit."""
     return hashlib.blake2s(line.encode("utf-8"), digest_size=2).hexdigest()[:2]
 
 
@@ -154,6 +156,21 @@ class EditOutcome:
     message: str
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write via same-directory temp file + fsync + os.replace() (cross-platform, crash-safe)."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as out:
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def apply_hashline_edit(
     path: Path,
     *,
@@ -161,7 +178,7 @@ def apply_hashline_edit(
     end_anchor: str,
     replacement_lines: list[str],
 ) -> EditOutcome:
-    """Optimistically verifies line hashes and syntax-checks Python before committing."""
+    """Optimistically verifies line hashes, syntax-checks Python via ast.parse, and writes atomically."""
     original = path.read_text(encoding="utf-8").splitlines()
     s_num_str, s_hash = start_anchor.split(":", 1)
     e_num_str, e_hash = end_anchor.split(":", 1)
@@ -176,18 +193,15 @@ def apply_hashline_edit(
     candidate_text = "\n".join(updated) + "\n"
 
     if path.suffix == ".py":
-        with tempfile.NamedTemporaryFile("w", suffix=".py", encoding="utf-8", delete=True) as tmp:
-            tmp.write(candidate_text)
-            tmp.flush()
-            try:
-                py_compile.compile(tmp.name, doraise=True)
-            except py_compile.PyCompileError as exc:
-                return EditOutcome(
-                    False,
-                    f"Edit reverted — syntax error detected before save:\n{exc.msg}\nFix syntax and retry.",
-                )
+        try:
+            ast.parse(candidate_text, filename=str(path))
+        except SyntaxError as exc:
+            return EditOutcome(
+                False,
+                f"Edit reverted — syntax error on line {exc.lineno}: {exc.msg}\nFix syntax and retry.",
+            )
 
-    path.write_text(candidate_text, encoding="utf-8")
+    _atomic_write_text(path, candidate_text)
     return EditOutcome(True, read_hashline_window(path, start_line=max(1, s_idx - 5), window=40))
 ```
 
