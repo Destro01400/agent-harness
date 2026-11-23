@@ -284,6 +284,10 @@ def _tool_result_succeeded(event: dict[str, Any]) -> bool:
     if ok_val is False:
         return False
 
+    _, exit_code = _get_event_field(event, ("exit_code", "returncode", "process.exit.code"))
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        return False
+
     _, err_val = _get_event_field(event, ("error", "error_code"))
     if isinstance(err_val, bool):
         if err_val:

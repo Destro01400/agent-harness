@@ -24,6 +24,10 @@ import urllib.parse
 
 DEFAULT_IGNORE_DIRS = {
     ".git",
+    ".agent",
+    ".agents",
+    ".claude",
+    ".opencode",
     "node_modules",
     "__pycache__",
     ".venv",
@@ -37,7 +41,7 @@ DEFAULT_IGNORE_DIRS = {
 }
 
 PY_EXTS = {".py"}
-JS_TS_EXTS = {".ts", ".tsx", ".js", ".mjs"}
+JS_TS_EXTS = {".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
 
 HELP_BASE = "https://github.com/Destro01400/agent-harness/blob/main/references"
 
@@ -2184,7 +2188,7 @@ def audit_js_ts_file(f: Path, root: Path) -> list[Finding]:
         local_var_rhs[vname] = rhs
         if "${" in rhs or "+" in strip_js_comments(rhs, blank_strings=True):
             tainted_cmd_vars.add(vname)
-        if re.search(r"\bprocess\.env\b", rhs):
+        if re.search(r"\bprocess\.env\b(?!\s*\.\s*[A-Za-z_$][\w$]*)", rhs):
             raw_env_vars_js.add(vname)
         reg_m = re.match(r"^/(.+?)/([a-z]*)\b", rhs)
         if reg_m and VERDICT_LABEL_RE.search(reg_m.group(1)) and "g" not in reg_m.group(2):

